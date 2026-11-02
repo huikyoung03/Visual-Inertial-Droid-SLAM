@@ -592,6 +592,7 @@ def _build_full_imu_system(
     imu_info_weight_eps=1e-12,
     use_imu_full_covariance_weighting=False,
     use_learned_imu_precision=False,
+    imu_cross_modal_calibration=None,
     imu_optimize_bias=True,
     use_imu_bias_random_walk=False,
     imu_bias_random_walk=None,
@@ -767,6 +768,22 @@ def _build_full_imu_system(
             "full IMU confidence must have one legacy or three component channels, "
             f"got {tuple(confidence.shape)}"
         )
+    if imu_cross_modal_calibration is None:
+        cross_modal = torch.ones(
+            (1, 1, 3), device=pose_data.device, dtype=pose_data.dtype
+        )
+    else:
+        cross_modal = imu_cross_modal_calibration.to(
+            device=pose_data.device, dtype=pose_data.dtype
+        )
+        if cross_modal.numel() != 3:
+            raise ValueError(
+                "imu_cross_modal_calibration must contain [R, v, p], got "
+                f"{tuple(cross_modal.shape)}"
+            )
+        cross_modal = cross_modal.reshape(1, 1, 3)
+        if not bool(torch.isfinite(cross_modal).all().item()) or bool((cross_modal <= 0).any().item()):
+            raise ValueError("imu_cross_modal_calibration must be finite and positive")
     adaptive_gate = _select_temporal_gate(
         imu_adaptive_gate, dst, B, num_frames, pose_data.device, pose_data.dtype
     )
@@ -1030,9 +1047,11 @@ def _build_full_imu_system(
     # are [position, velocity, rotation, accel-bias, gyro-bias]. Direct
     # precision is a full positive inverse-variance multiplier; legacy
     # confidence remains a probability and is therefore capped at one.
-    rot_confidence = confidence[:, :, 0:1]
-    vel_confidence = confidence[:, :, 1:2]
-    pos_confidence = confidence[:, :, 2:3]
+    # ``cross_modal`` establishes the learned global R/v/p information
+    # calibration; confidence remains the bounded temporal attenuation.
+    rot_confidence = confidence[:, :, 0:1] * cross_modal[:, :, 0:1]
+    vel_confidence = confidence[:, :, 1:2] * cross_modal[:, :, 1:2]
+    pos_confidence = confidence[:, :, 2:3] * cross_modal[:, :, 2:3]
     bias_confidence = (
         torch.ones_like(rot_confidence)
         if use_learned_imu_precision
@@ -1187,6 +1206,7 @@ def BA(
     imu_info_weight_eps=1e-12,
     use_imu_full_covariance_weighting=False,
     use_learned_imu_precision=False,
+    imu_cross_modal_calibration=None,
     imu_optimize_bias=True,
     use_imu_bias_random_walk=False,
     imu_bias_random_walk=None,
@@ -1292,6 +1312,7 @@ def BA(
             imu_info_weight_eps=imu_info_weight_eps,
             use_imu_full_covariance_weighting=use_imu_full_covariance_weighting,
             use_learned_imu_precision=use_learned_imu_precision,
+            imu_cross_modal_calibration=imu_cross_modal_calibration,
             imu_optimize_bias=imu_optimize_bias,
             use_imu_bias_random_walk=use_imu_bias_random_walk,
             imu_bias_random_walk=imu_bias_random_walk,

@@ -25,7 +25,9 @@ from geom.imu_factor import (
     so3_left_jacobian,
     so3_left_jacobian_inv,
     edge_imu_innovation_features,
+    edge_imu_rotation_flow_innovation,
     edge_imu_quality_features,
+    joint_temporal_edge_support,
     temporal_imu_confidence_from_edges,
     temporal_imu_precision_from_edges,
     temporal_imu_visual_innovation_features,
@@ -111,10 +113,19 @@ class FactorGraph:
         apply_imu_residual=None,
         use_learned_imu_confidence=False,
         use_learned_imu_precision=False,
+        use_learned_imu_cross_modal_calibration=False,
+        imu_cross_modal_calibration=None,
         use_imu_precision_discrepancy=False,
         use_imu_precision_innovation=False,
         use_imu_precision_visual_innovation=False,
         use_imu_precision_edge_fusion=False,
+        use_joint_visual_imu_confidence=False,
+        joint_visual_imu_full_stage_only=False,
+        use_imu_rotation_flow_adapter=False,
+        imu_rotation_flow_adapter_full_stage_only=False,
+        imu_joint_confidence_min=0.0,
+        imu_joint_confidence_max=1.0,
+        imu_joint_visual_gate_min=0.0,
         use_component_imu_confidence=False,
         use_dvi_imu_confidence=False,
         use_dvi_imu_quality_fusion=False,
@@ -180,10 +191,14 @@ class FactorGraph:
         imu_ba_outer_relinearize=False,
         imu_ba_outer_relinearize_interval=10,
         imu_ba_outer_window=0,
+        imu_full_ba_outer_relinearize=False,
         imu_ba_debug=False,
         imu_ba_debug_path=None,
         imu_ba_debug_max_rows=20000,
         imu_ba_debug_stage="graph",
+        imu_state_update_audit_path=None,
+        imu_influence_audit_path=None,
+        imu_influence_audit_min_window=128,
     ):
         """
         DROID-SLAM의 factor graph를 관리하는 클래스.
@@ -248,6 +263,10 @@ class FactorGraph:
         # three R/v/p outputs are covariance-relative reliabilities: one
         # retains the physical IMU factor and values below one attenuate it.
         self.use_learned_imu_precision = bool(use_learned_imu_precision)
+        self.use_learned_imu_cross_modal_calibration = bool(
+            use_learned_imu_cross_modal_calibration
+        )
+        self.imu_cross_modal_calibration = imu_cross_modal_calibration
         self.use_imu_precision_discrepancy = bool(
             use_imu_precision_discrepancy and self.use_learned_imu_precision
         )
@@ -261,6 +280,40 @@ class FactorGraph:
         self.use_imu_precision_edge_fusion = bool(
             use_imu_precision_edge_fusion and self.use_imu_precision_innovation
         )
+        # The joint route is intentionally independent of the legacy
+        # innovation adapters: it needs the same causal innovation only as
+        # input evidence, then gates both IMU precision and visual DBA weight.
+        self.use_joint_visual_imu_confidence = bool(
+            use_joint_visual_imu_confidence and self.use_learned_imu_precision
+        )
+        # A two-stage solve must keep its visual-only prefix exactly visual.
+        # Preserve the requested joint route here and toggle only the active
+        # flag in ``set_imu_ba_stage``.  This is not a confidence threshold:
+        # it prevents an IMU-conditioned visual gate from altering the
+        # preconditioner before an IMU factor participates in the objective.
+        self._configured_use_joint_visual_imu_confidence = bool(
+            self.use_joint_visual_imu_confidence
+        )
+        self.joint_visual_imu_full_stage_only = bool(
+            joint_visual_imu_full_stage_only
+            and self._configured_use_joint_visual_imu_confidence
+        )
+        self.use_imu_rotation_flow_adapter = bool(
+            use_imu_rotation_flow_adapter and self.use_learned_imu_precision
+        )
+        # Preserve the requested route separately from the active local-stage
+        # route. A two-stage frontend toggles the latter between visual-only
+        # and full 15DoF DBA without mutating the user's requested setting.
+        self._configured_use_imu_rotation_flow_adapter = bool(
+            self.use_imu_rotation_flow_adapter
+        )
+        self.imu_rotation_flow_adapter_full_stage_only = bool(
+            imu_rotation_flow_adapter_full_stage_only
+            and self._configured_use_imu_rotation_flow_adapter
+        )
+        self.imu_joint_confidence_min = float(imu_joint_confidence_min)
+        self.imu_joint_confidence_max = float(imu_joint_confidence_max)
+        self.imu_joint_visual_gate_min = float(imu_joint_visual_gate_min)
         self.use_learned_imu_confidence = bool(
             use_learned_imu_confidence and not self.use_learned_imu_precision
         )
@@ -379,10 +432,21 @@ class FactorGraph:
             1, int(imu_ba_outer_relinearize_interval)
         )
         self.imu_ba_outer_window = max(0, int(imu_ba_outer_window))
+        # Unlike ``imu_ba_outer_relinearize``, which is a sparse fixed-bias
+        # 9DoF shared-bias control, this opt-in switch applies to every
+        # *already active* full 15DoF BA call. A full factor is nonlinear in
+        # pose, velocity, and local biases, so each CUDA step receives an IMU
+        # prior rebuilt at the state produced by the preceding step. The
+        # two-stage pose-only phase remains visual-only because it switches
+        # ``self.use_full_imu_ba`` off.
+        self.imu_full_ba_outer_relinearize = bool(
+            imu_full_ba_outer_relinearize
+        )
         self.last_joint_shared_bias_status = {"enabled": 0.0, "reason": "not_run"}
         self._joint_bias_update_count = 0
         self._last_joint_bias_attempt_frame = -self.imu_joint_bias_interval
         self._last_outer_relinearization_frame = -self.imu_ba_outer_relinearize_interval
+        self._reported_full_imu_ba_outer_relinearization = False
         self._reported_imu_ba_prior = False
         self._reported_imu_alignment_wait = False
         self.last_imu_confidence = None
@@ -392,6 +456,16 @@ class FactorGraph:
         self.imu_ba_debug_stage = str(imu_ba_debug_stage)
         self._imu_ba_debug_rows = []
         self._imu_ba_debug_seen = 0
+        # Write-only audit of the actual state change made by each full 15DoF
+        # BA call. This separates "the IMU residual decreased" from "the
+        # camera pose moved" and is never read by the solver.
+        self.imu_state_update_audit_path = imu_state_update_audit_path
+        # This is a separate, opt-in solver diagnostic.  Unlike the per-edge
+        # IMU debug stream it records one global-window comparison between
+        # the visual and inertial normal systems, and never changes BA.
+        self.imu_influence_audit_path = imu_influence_audit_path
+        self.imu_influence_audit_min_window = max(1, int(imu_influence_audit_min_window))
+        self._imu_influence_audit_recorded = False
 
         # IMU state aliases.
         #
@@ -482,6 +556,10 @@ class FactorGraph:
             device=device,
             dtype=torch.float
         )
+        # One detached reciprocal gain per active edge. Inactive factors do
+        # not refresh evidence, so cache their original DROID weight instead
+        # of leaking a stale full-stage gain into the next visual-only stage.
+        self.weight_joint_gain = torch.ones([1, 0, 1, 1, 1], device=device)
 
         ############################################################
         # inactive / bad factor storage
@@ -523,6 +601,10 @@ class FactorGraph:
             self.use_imu_ba_prior = False
             self.imu_optimize_bias = False
             self.apply_imu_residual = False
+            if self.imu_rotation_flow_adapter_full_stage_only:
+                self.use_imu_rotation_flow_adapter = False
+            if self.joint_visual_imu_full_stage_only:
+                self.use_joint_visual_imu_confidence = False
             return
 
         if stage == "full_15dof":
@@ -540,6 +622,12 @@ class FactorGraph:
             self.imu_optimize_bias = True
             # The full preintegration factor already contains rotation.
             self.apply_imu_residual = False
+            self.use_imu_rotation_flow_adapter = (
+                self._configured_use_imu_rotation_flow_adapter
+            )
+            self.use_joint_visual_imu_confidence = (
+                self._configured_use_joint_visual_imu_confidence
+            )
             self._imu_tuned_confidence_iteration = 0
             return
 
@@ -581,6 +669,9 @@ class FactorGraph:
                 num_frames=num_frames,
                 fallback=quality_fallback if quality_fallback is not None else 1.0,
                 return_coverage=True,
+                allow_factor_amplification=bool(
+                    getattr(self, "use_joint_visual_imu_confidence", False)
+                ),
             )
         else:
             quality_fallback = self._temporal_imu_quality_confidence(num_frames)
@@ -654,6 +745,72 @@ class FactorGraph:
             num_frames=count,
         )
 
+    def _joint_factor_support(self, ii, jj):
+        if not self.use_joint_visual_imu_confidence or int(
+            getattr(self.update_op, "joint_allocation_version", 0)
+        ) != 1:
+            return None
+        count = int(self.video.counter.value)
+        support = joint_temporal_edge_support(
+            self.video.imu_delta[:count], self.video.imu_valid[:count],
+            ii, jj, max_dt=self.imu_full_max_dt,
+        )
+        if (not self.use_full_imu_ba or not self.use_imu_ba_prior
+                or self.imu_ba_prior_weight <= 0.0
+                or (self.require_imu_alignment and not self._has_imu_alignment())):
+            return torch.zeros_like(support)
+        dst = torch.maximum(ii, jj).long()
+        support = support & (self.video.imu_weight[dst] > 0)[None]
+        scale = self._imu_metric_scale(self.video.poses.device, self.video.poses.dtype).clamp_min(1e-12)
+        for start, limit in ((4, self.imu_full_max_dv), (7, self.imu_full_max_dp)):
+            if limit > 0:
+                norm = self.video.imu_delta[dst, start:start + 3].norm(dim=-1) / scale
+                support = support & (norm <= limit)[None]
+        return support
+
+    def _edge_imu_rotation_flow(self, ii, jj):
+        """Build the causal IMU-minus-visual rotation-flow innovation.
+
+        This runs only when the new learned correspondence adapter is enabled.
+        It reads the current graph poses and the same bias-corrected prior that
+        full 15DoF BA receives; no GT, future trajectory, or global alignment
+        enters this runtime quantity.
+        """
+
+        if not self.use_imu_rotation_flow_adapter or ii.numel() == 0:
+            return None
+        count = max(
+            int(self.video.counter.value),
+            int(torch.maximum(ii.max(), jj.max()).item()) + 1,
+        )
+        if count <= 1:
+            return None
+        poses = self.video.poses[:count].unsqueeze(0).detach()
+        local_gyro = None
+        if self.use_full_imu_ba and getattr(self.video, "bias_gyro", None) is not None:
+            local_gyro = self.video.bias_gyro[:count].unsqueeze(0).detach()
+        return edge_imu_rotation_flow_innovation(
+            poses,
+            self.video.imu_delta[:count],
+            self.video.intrinsics[:count].unsqueeze(0),
+            ii,
+            jj,
+            height=self.ht,
+            width=self.wd,
+            imu_valid=self.video.imu_valid[:count],
+            imu_bias_jacobian=(
+                self.video.imu_bias_jacobian[:count]
+                if getattr(self.video, "imu_bias_jacobian", None) is not None
+                else None
+            ),
+            gyro_bias=self._aligned_or_default_bias(
+                "imu_global_bias_gyro", self.imu_gyro_bias, poses.device, poses.dtype
+            ),
+            local_gyro_bias=local_gyro,
+            compose_order=self.imu_full_compose_order,
+            inverse_imu=self.imu_full_inverse,
+        )
+
     def _temporal_imu_precision_innovation(self, count):
         """Return causal visual--IMU disagreement features for direct precision.
 
@@ -672,6 +829,7 @@ class FactorGraph:
             or not (
                 self.use_imu_precision_discrepancy
                 or self.use_imu_precision_innovation
+                or self.use_joint_visual_imu_confidence
             )
         ):
             return None
@@ -813,6 +971,8 @@ class FactorGraph:
             imu_innovation=(
                 discrepancy if self.use_imu_precision_innovation else None
             ),
+            minimum=0.0,
+            maximum=1.0,
         )
         if (
             precision is None
@@ -848,6 +1008,24 @@ class FactorGraph:
                 print(f"[IMU-RESIDUAL] stage={stage}, applied={applied}")
         except Exception as e:
             print(f"[IMU-RESIDUAL WARNING] stage={stage}, failed: {e}")
+
+    def _reciprocal_allocation_active(self):
+        return bool(getattr(self, "use_joint_visual_imu_confidence", False)) and int(
+            getattr(getattr(self, "update_op", None), "joint_allocation_version", 0)
+        ) == 1
+
+    def _runtime_confidence_sqrt(self, confidence):
+        if self.use_learned_imu_precision:
+            if self._reciprocal_allocation_active():
+                return confidence.clamp_min(1e-12).sqrt()
+            return confidence.clamp(1e-12, 1.0).sqrt()
+        return confidence.clamp(0.0, 1.0).sqrt()
+
+    def _current_visual_weight_gain(self, weight):
+        gain = getattr(self.update_op, "last_joint_visual_gate", None)
+        if self._reciprocal_allocation_active() and gain is not None:
+            return gain.detach().to(weight).reshape(*weight.shape[:2], 1, 1, 1)
+        return weight.new_ones((*weight.shape[:2], 1, 1, 1))
 
     def _confidence_components_for_pose_index(self, pose_ix):
         """Return `[rotation, velocity, position]` confidence for one row."""
@@ -891,7 +1069,7 @@ class FactorGraph:
             return np.ones(3, dtype=np.float64)
 
         if self.use_learned_imu_precision:
-            return np.clip(values[:3], 1e-12, 1.0)
+            return np.clip(values[:3], 1e-12, None if self._reciprocal_allocation_active() else 1.0)
         return np.clip(values[:3], 0.0, 1.0)
 
     def _confidence_for_pose_index(self, pose_ix):
@@ -899,7 +1077,28 @@ class FactorGraph:
 
         return float(self._confidence_components_for_pose_index(pose_ix)[0])
 
+    def _cross_modal_components(self):
+        """Return positive global [rotation, velocity, position] precision."""
+
+        if not self.use_learned_imu_cross_modal_calibration:
+            return np.ones(3, dtype=np.float64)
+        try:
+            values = self.imu_cross_modal_calibration
+            if torch.is_tensor(values):
+                values = values.detach().cpu().reshape(-1).numpy()
+            values = np.asarray(values, dtype=np.float64).reshape(-1)
+        except Exception:
+            return np.ones(3, dtype=np.float64)
+        if values.size != 3 or not np.all(np.isfinite(values)) or np.any(values <= 0.0):
+            raise ValueError(
+                "learned IMU cross-modal calibration must be three finite "
+                "positive [R, v, p] values"
+            )
+        return values
+
     def _imu_confidence_mode(self):
+        if self.use_learned_imu_cross_modal_calibration:
+            return "learned_precision_cross_modal"
         if self.imu_tuned_confidence_schedule is not None:
             return "tuned"
         if self.use_learned_imu_precision:
@@ -1083,6 +1282,289 @@ class FactorGraph:
             f"to {path} (seen={self._imu_ba_debug_seen})"
         )
         self._imu_ba_debug_rows.clear()
+
+    def _append_imu_influence_audit(self, row):
+        """Append one solver-influence record without touching BA state."""
+
+        if self.imu_influence_audit_path in (None, ""):
+            return
+        path = Path(self.imu_influence_audit_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fields = sorted(row)
+        write_header = not path.exists()
+        with path.open("a", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+        print(
+            "[IMU-INFLUENCE] wrote visual/IMU normal-system audit "
+            f"window=[{row['window_t0']},{row['window_t1']}) to {path}"
+        )
+
+    def _append_imu_state_update_audit(self, row):
+        """Append one full-15DoF state-update record without changing BA."""
+
+        if self.imu_state_update_audit_path in (None, ""):
+            return
+        path = Path(self.imu_state_update_audit_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fields = sorted(row)
+        write_header = not path.exists()
+        with path.open("a", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+    @staticmethod
+    def _state_update_norm_stats(values, unit_scale=1.0):
+        """Return finite vector-norm statistics as plain Python floats."""
+
+        values = torch.as_tensor(values).detach().reshape(-1, 3)
+        finite = torch.isfinite(values).all(dim=-1)
+        values = values[finite]
+        if values.numel() == 0:
+            return {
+                "mean": float("nan"),
+                "median": float("nan"),
+                "p95": float("nan"),
+                "max": float("nan"),
+            }
+        norms = torch.linalg.vector_norm(values, dim=-1) * float(unit_scale)
+        return {
+            "mean": float(norms.mean().cpu().item()),
+            "median": float(norms.median().cpu().item()),
+            "p95": float(torch.quantile(norms, 0.95).cpu().item()),
+            "max": float(norms.max().cpu().item()),
+        }
+
+    def _capture_full_imu_ba_state(self, t0, t1):
+        """Clone the full local state touched by one 15DoF BA call."""
+
+        t0 = max(0, int(t0))
+        t1 = min(int(t1), int(self.video.counter.value))
+        if t1 <= t0:
+            return None
+        return {
+            "t0": t0,
+            "t1": t1,
+            "poses": self.video.poses[t0:t1].detach().clone(),
+            "velocities": self.video.velocities[t0:t1].detach().clone(),
+            "bias_acc": self.video.bias_acc[t0:t1].detach().clone(),
+            "bias_gyro": self.video.bias_gyro[t0:t1].detach().clone(),
+            "unit_scale": float(
+                self.video.imu_unit_scale.detach().reshape(-1)[0].cpu().item()
+            ),
+        }
+
+    @torch.no_grad()
+    def _record_full_imu_ba_state_update(
+        self, snapshot, *, stage, outer_index, outer_iterations, cuda_iterations
+    ):
+        """Record pose/velocity/local-bias motion produced by one BA call.
+
+        Pose centres and velocities are converted with ``imu_unit_scale`` so
+        their reported values are in metres and metres/second. Bias corrections
+        already live in physical IMU units.
+        """
+
+        if self.imu_state_update_audit_path in (None, "") or snapshot is None:
+            return
+        try:
+            t0, t1 = snapshot["t0"], snapshot["t1"]
+            before_pose = snapshot["poses"]
+            after_pose = self.video.poses[t0:t1].detach()
+            scale = max(float(snapshot["unit_scale"]), 1e-12)
+
+            center_delta = (
+                camera_center_from_pose_data(after_pose)
+                - camera_center_from_pose_data(before_pose)
+            )
+            delta_quat = quat_multiply(
+                after_pose[:, 3:7], quat_inverse(before_pose[:, 3:7])
+            )
+            rotation_delta = quat_to_rotvec(delta_quat)
+            velocity_delta = self.video.velocities[t0:t1].detach() - snapshot[
+                "velocities"
+            ]
+            accel_bias_delta = self.video.bias_acc[t0:t1].detach() - snapshot[
+                "bias_acc"
+            ]
+            gyro_bias_delta = self.video.bias_gyro[t0:t1].detach() - snapshot[
+                "bias_gyro"
+            ]
+
+            def put(prefix, stats, row):
+                for key, value in stats.items():
+                    row[f"{prefix}_{key}"] = value
+
+            row = {
+                "stage": str(stage),
+                "graph_stage": self.imu_ba_debug_stage,
+                "outer_index": int(outer_index),
+                "outer_iterations": int(outer_iterations),
+                "cuda_iterations": int(cuda_iterations),
+                "window_t0": int(t0),
+                "window_t1": int(t1),
+                "state_count": int(t1 - t0),
+                "imu_unit_scale_before": scale,
+            }
+            put("pose_center_delta_m", self._state_update_norm_stats(center_delta, 1.0 / scale), row)
+            put("pose_rotation_delta_deg", self._state_update_norm_stats(rotation_delta, 180.0 / np.pi), row)
+            put("velocity_delta_mps", self._state_update_norm_stats(velocity_delta, 1.0 / scale), row)
+            put("accel_bias_delta_mps2", self._state_update_norm_stats(accel_bias_delta), row)
+            put("gyro_bias_delta_radps", self._state_update_norm_stats(gyro_bias_delta), row)
+            self._append_imu_state_update_audit(row)
+        except Exception as exc:
+            print(f"[IMU-STATE-AUDIT WARNING] state update audit skipped: {exc}")
+
+    @torch.no_grad()
+    def _record_visual_imu_normal_system_audit(
+        self,
+        *,
+        target,
+        weight,
+        ii,
+        jj,
+        t0,
+        t1,
+        state_prior_H,
+        state_prior_v,
+        state_prior_ii,
+        state_prior_jj,
+    ):
+        """Measure visual and IMU *raw pose-block* influence in one BA window.
+
+        DROID's production CUDA DBA eliminates depth before solving; exposing
+        that full internal matrix would require changing the solver API.  This
+        diagnostic instead measures the two systems at the exact common point
+        where they are added: visual reprojection normal equations and the
+        Python-built 15DoF IMU prior.  The reported traces/gradient norms are
+        therefore a comparable pre-Schur proxy, not a claim of final Hessian
+        ownership.  It is intentionally write-only and is never used in the
+        optimization.
+        """
+
+        if (
+            self.imu_influence_audit_path in (None, "")
+            or self._imu_influence_audit_recorded
+            or self.imu_ba_debug_stage not in ("backend", "async_backend")
+        ):
+            return
+
+        t0, t1 = int(t0), int(t1)
+        num_states = t1 - t0
+        if num_states < self.imu_influence_audit_min_window:
+            return
+        if (
+            state_prior_H is None
+            or state_prior_v is None
+            or state_prior_ii is None
+            or state_prior_jj is None
+            or state_prior_H.numel() == 0
+        ):
+            return
+
+        try:
+            edge_mask = (
+                (ii >= t0) & (ii < t1) & (jj >= t0) & (jj < t1)
+            )
+            if not bool(edge_mask.any().item()):
+                return
+
+            audit_ii = ii[edge_mask].contiguous()
+            audit_jj = jj[edge_mask].contiguous()
+            # Inputs to video.ba are [E, 2, H, W]. projective_transform and
+            # the Python BA reference use [B, E, H, W, 2].
+            audit_target = target[edge_mask].permute(0, 2, 3, 1).unsqueeze(0)
+            audit_weight = weight[edge_mask].permute(0, 2, 3, 1).unsqueeze(0)
+            poses = SE3(self.video.poses.unsqueeze(0))
+            disps = self.video.disps.unsqueeze(0)
+            intrinsics = self.video.intrinsics.unsqueeze(0)
+            coords, valid, (Ji, Jj, _) = pops.projective_transform(
+                poses,
+                disps,
+                intrinsics,
+                audit_ii,
+                audit_jj,
+                jacobian=True,
+            )
+            residual = (audit_target - coords).reshape(1, audit_ii.numel(), -1, 1)
+            visual_weight = (
+                0.001 * (valid * audit_weight)
+            ).reshape(1, audit_ii.numel(), -1, 1)
+            Ji = Ji.reshape(1, audit_ii.numel(), -1, 6)
+            Jj = Jj.reshape(1, audit_ii.numel(), -1, 6)
+
+            visual_Hii = torch.matmul(
+                (visual_weight * Ji).transpose(2, 3), Ji
+            )[0]
+            visual_Hjj = torch.matmul(
+                (visual_weight * Jj).transpose(2, 3), Jj
+            )[0]
+            visual_vi = torch.matmul(
+                (visual_weight * Ji).transpose(2, 3), residual
+            ).squeeze(-1)[0]
+            visual_vj = torch.matmul(
+                (visual_weight * Jj).transpose(2, 3), residual
+            ).squeeze(-1)[0]
+
+            visual_v = torch.zeros(
+                (num_states, 6), device=visual_vi.device, dtype=visual_vi.dtype
+            )
+            visual_v.index_add_(0, audit_ii - t0, visual_vi)
+            visual_v.index_add_(0, audit_jj - t0, visual_vj)
+            visual_pose_trace = (
+                torch.diagonal(visual_Hii, dim1=-2, dim2=-1).sum()
+                + torch.diagonal(visual_Hjj, dim1=-2, dim2=-1).sum()
+            )
+
+            # Only diagonal state blocks contribute to the global matrix
+            # trace. The prior's first six entries share the exact DROID pose
+            # tangent basis with the visual block; v/b entries are reported
+            # separately because they are unique to the 15DoF solve.
+            prior_diag = state_prior_ii == state_prior_jj
+            prior_pose_trace = torch.diagonal(
+                state_prior_H[prior_diag, :6, :6], dim1=-2, dim2=-1
+            ).sum()
+            prior_full_trace = torch.diagonal(
+                state_prior_H[prior_diag], dim1=-2, dim2=-1
+            ).sum()
+            prior_pose_gradient = torch.linalg.vector_norm(state_prior_v[:, :6])
+            prior_full_gradient = torch.linalg.vector_norm(state_prior_v)
+            visual_gradient = torch.linalg.vector_norm(visual_v)
+
+            visual_trace_value = float(visual_pose_trace.detach().cpu().item())
+            prior_trace_value = float(prior_pose_trace.detach().cpu().item())
+            visual_grad_value = float(visual_gradient.detach().cpu().item())
+            prior_grad_value = float(prior_pose_gradient.detach().cpu().item())
+            eps = 1e-12
+            row = {
+                "stage": self.imu_ba_debug_stage,
+                "window_t0": t0,
+                "window_t1": t1,
+                "state_count": num_states,
+                "visual_edge_count": int(audit_ii.numel()),
+                "imu_prior_block_count": int(state_prior_H.shape[0]),
+                "state_dim": int(state_prior_H.shape[-1]),
+                "visual_pose_hessian_trace": visual_trace_value,
+                "imu_pose_hessian_trace": prior_trace_value,
+                "imu_full_hessian_trace": float(prior_full_trace.detach().cpu().item()),
+                "imu_to_visual_pose_trace_ratio": prior_trace_value / max(visual_trace_value, eps),
+                "visual_pose_gradient_norm": visual_grad_value,
+                "imu_pose_gradient_norm": prior_grad_value,
+                "imu_full_gradient_norm": float(prior_full_gradient.detach().cpu().item()),
+                "imu_to_visual_pose_gradient_ratio": prior_grad_value / max(visual_grad_value, eps),
+                "confidence_mode": self._imu_confidence_mode(),
+            }
+            self._append_imu_influence_audit(row)
+            self._imu_influence_audit_recorded = True
+        except Exception as exc:
+            # Auditing must never change or abort a reconstruction. A single
+            # warning exposes an unsupported tensor layout for follow-up.
+            self._imu_influence_audit_recorded = True
+            print(f"[IMU-INFLUENCE WARNING] normal-system audit skipped: {exc}")
 
     def _build_imu_ba_pose_prior(self, t0, t1):
         """
@@ -1987,6 +2469,8 @@ class FactorGraph:
             if not self.imu_ba_debug:
                 return
 
+            cross_modal_debug = self._cross_modal_components()
+
             self._record_imu_ba_debug({
                 "window_t0": t0,
                 "window_t1": t1,
@@ -2000,6 +2484,9 @@ class FactorGraph:
                 "confidence_rot": float(confidence_rot),
                 "confidence_vel": float(confidence_vel),
                 "confidence_pos": float(confidence_pos),
+                "cross_modal_rot": float(cross_modal_debug[0]),
+                "cross_modal_vel": float(cross_modal_debug[1]),
+                "cross_modal_pos": float(cross_modal_debug[2]),
                 "weight": float(weight),
                 "metric_scale": float(metric_scale.detach().cpu().item()),
                 "alignment_ready": int(self._has_imu_alignment()),
@@ -2385,7 +2872,22 @@ class FactorGraph:
                 if self.use_learned_imu_precision
                 else float(np.mean(confidence_components))
             )
-            component_scale = torch.as_tensor(
+            # ``alpha`` is a learned global cross-modal information
+            # calibration.  Confidence remains the per-interval attenuation;
+            # bias random-walk rows deliberately stay physical and are not
+            # calibrated by this visual/IMU unit conversion.
+            cross_modal = self._cross_modal_components()
+            # Keep the per-edge confidence and the learned global
+            # cross-modal calibration as two distinct quantities.  A
+            # confidence is an attenuation, so its information must stay in
+            # [0, 1].  ``alpha`` is instead a positive relative information
+            # calibration between the visual and IMU units and may be above
+            # one.  Clamping their *product* to one silently discarded every
+            # alpha above 1/c (and made diagnostic x10/x100/... runs
+            # identical).  Applying the square roots separately gives the
+            # intended normal-system information c * alpha without turning
+            # alpha into a hand-tuned global lambda.
+            confidence_scale = torch.as_tensor(
                 [confidence_pos] * 3
                 + [confidence_vel] * 3
                 + [confidence_rot] * 3
@@ -2393,10 +2895,20 @@ class FactorGraph:
                 device=device,
                 dtype=dtype,
             )
-            if self.use_learned_imu_precision:
-                component_scale = component_scale.clamp(1e-12, 1.0).sqrt()
-            else:
-                component_scale = component_scale.clamp(0.0, 1.0).sqrt()
+            # Reciprocal c*gI is an effective information multiplier, not a
+            # bounded probability. Preserve amplification at BOTH this sqrt
+            # and the preceding row getter; legacy modes keep their contract.
+            confidence_scale = self._runtime_confidence_sqrt(confidence_scale)
+
+            cross_modal_scale = torch.as_tensor(
+                [cross_modal[2]] * 3
+                + [cross_modal[1]] * 3
+                + [cross_modal[0]] * 3
+                + ([1.0] * 6 if optimize_bias else []),
+                device=device,
+                dtype=dtype,
+            ).clamp_min(1e-12).sqrt()
+            component_scale = confidence_scale * cross_modal_scale
             # If one corrupt/missing IMU-information row occurs, retain the
             # exact compatibility p/v/R scale for that row rather than turning
             # it into an accidental high-weight factor.
@@ -2904,10 +3416,26 @@ class FactorGraph:
         if outer_relinearize:
             cuda_iterations = 1
             outer_iterations = max(1, int(itrs))
+            if (
+                self.imu_full_ba_outer_relinearize
+                and self.use_full_imu_ba
+                and not self._reported_full_imu_ba_outer_relinearization
+            ):
+                print(
+                    "[IMU] full 15DoF outer relinearization enabled: "
+                    "rebuilding the IMU prior after every CUDA BA step"
+                )
+                self._reported_full_imu_ba_outer_relinearization = True
 
         ba_result = None
         for outer_index in range(outer_iterations):
             joint_bias_info = None
+            state_snapshot = (
+                self._capture_full_imu_ba_state(ba_t0, ba_t1)
+                if self.use_full_imu_ba
+                and self.imu_state_update_audit_path not in (None, "")
+                else None
+            )
             if self.use_full_imu_ba:
                 if self._joint_shared_bias_enabled():
                     (
@@ -2941,6 +3469,19 @@ class FactorGraph:
                     pose_prior_jj,
                 ) = self._build_imu_ba_pose_prior(ba_t0, ba_t1)
 
+            self._record_visual_imu_normal_system_audit(
+                target=target,
+                weight=weight,
+                ii=ii,
+                jj=jj,
+                t0=ba_t0,
+                t1=ba_t1,
+                state_prior_H=pose_prior_H,
+                state_prior_v=pose_prior_v,
+                state_prior_ii=pose_prior_ii,
+                state_prior_jj=pose_prior_jj,
+            )
+
             ba_result = self.video.ba(
                 target,
                 weight,
@@ -2966,6 +3507,14 @@ class FactorGraph:
                 self._apply_joint_shared_bias_update(
                     ba_result, joint_bias_info, stage=update_stage
                 )
+
+            self._record_full_imu_ba_state_update(
+                state_snapshot,
+                stage=stage,
+                outer_index=outer_index + 1,
+                outer_iterations=outer_iterations,
+                cuda_iterations=cuda_iterations,
+            )
 
         return ba_result
 
@@ -3198,6 +3747,9 @@ class FactorGraph:
         # target / weight 저장
         self.target = torch.cat([self.target, target], 1)
         self.weight = torch.cat([self.weight, weight], 1)
+        self.weight_joint_gain = torch.cat([
+            self.weight_joint_gain, weight.new_ones((*weight.shape[:2], 1, 1, 1))
+        ], 1)
 
     @autocast(enabled=True)
     def rm_factors(self, mask, store=False):
@@ -3222,7 +3774,10 @@ class FactorGraph:
             self.ii_inac = torch.cat([self.ii_inac, self.ii[mask]], 0)
             self.jj_inac = torch.cat([self.jj_inac, self.jj[mask]], 0)
             self.target_inac = torch.cat([self.target_inac, self.target[:, mask]], 1)
-            self.weight_inac = torch.cat([self.weight_inac, self.weight[:, mask]], 1)
+            self.weight_inac = torch.cat([
+                self.weight_inac,
+                self.weight[:, mask] / self.weight_joint_gain[:, mask],
+            ], 1)
 
         ############################################################
         # active factor 제거
@@ -3246,6 +3801,7 @@ class FactorGraph:
         # target / weight 제거
         self.target = self.target[:, ~mask]
         self.weight = self.weight[:, ~mask]
+        self.weight_joint_gain = self.weight_joint_gain[:, ~mask]
 
     @autocast(enabled=True)
     def rm_keyframe(self, ix):
@@ -3502,6 +4058,27 @@ class FactorGraph:
                 self.use_imu_precision_visual_innovation
             ),
             use_imu_precision_edge_fusion=self.use_imu_precision_edge_fusion,
+            use_joint_visual_imu_confidence=(
+                self.use_joint_visual_imu_confidence
+            ),
+            joint_imu_innovation=(
+                edge_imu_innovation_features(
+                    temporal_imu_innovation, self.ii, self.jj
+                )
+                if (
+                    temporal_imu_innovation is not None
+                    and self.use_joint_visual_imu_confidence
+                )
+                else None
+            ),
+            imu_joint_confidence_min=self.imu_joint_confidence_min,
+            joint_factor_support=self._joint_factor_support(self.ii, self.jj),
+            imu_joint_confidence_max=self.imu_joint_confidence_max,
+            imu_joint_visual_gate_min=self.imu_joint_visual_gate_min,
+            use_imu_rotation_flow_adapter=self.use_imu_rotation_flow_adapter,
+            imu_rotation_flow_innovation=self._edge_imu_rotation_flow(
+                self.ii, self.jj
+            ),
         )
         if self.use_learned_imu_prediction:
             self.net, delta, weight, damping, upmask, imu_edge_confidence = update_out
@@ -3537,6 +4114,7 @@ class FactorGraph:
 
             # confidence weight 저장
             self.weight = weight.to(dtype=torch.float)
+            self.weight_joint_gain = self._current_visual_weight_gain(self.weight)
 
             ht, wd = self.coords0.shape[0:2]
 
@@ -3609,7 +4187,16 @@ class FactorGraph:
                 and self._outer_imu_ba_relinearization_due()
                 and aligned_for_imu
             )
-            outer_relinearize = joint_bias_active or outer_control_active
+            full_15dof_relinearize_active = bool(
+                self.use_full_imu_ba
+                and self.imu_full_ba_outer_relinearize
+                and aligned_for_imu
+            )
+            outer_relinearize = (
+                joint_bias_active
+                or outer_control_active
+                or full_15dof_relinearize_active
+            )
             if joint_bias_active:
                 self._last_joint_bias_attempt_frame = int(self.video.counter.value)
             if outer_control_active:
@@ -3848,6 +4435,27 @@ class FactorGraph:
                             use_imu_precision_edge_fusion=(
                                 self.use_imu_precision_edge_fusion
                             ),
+                            use_joint_visual_imu_confidence=(
+                                self.use_joint_visual_imu_confidence
+                            ),
+                            joint_imu_innovation=(
+                                edge_imu_innovation_features(
+                                    temporal_imu_innovation, iis, jjs
+                                )
+                                if (
+                                    temporal_imu_innovation is not None
+                                    and self.use_joint_visual_imu_confidence
+                                )
+                                else None
+                            ),
+                            imu_joint_confidence_min=self.imu_joint_confidence_min,
+                            joint_factor_support=self._joint_factor_support(iis, jjs),
+                            imu_joint_confidence_max=self.imu_joint_confidence_max,
+                            imu_joint_visual_gate_min=self.imu_joint_visual_gate_min,
+                            use_imu_rotation_flow_adapter=self.use_imu_rotation_flow_adapter,
+                            imu_rotation_flow_innovation=self._edge_imu_rotation_flow(
+                                iis, jjs
+                            ),
                         )
                         if self.use_learned_imu_prediction:
                             net, delta, weight, damping, upmask, imu_edge_confidence = update_out
@@ -3865,6 +4473,7 @@ class FactorGraph:
                     self.net[:, v] = net
                     self.target[:, v] = coords1[:, v] + delta.float()
                     self.weight[:, v] = weight.float()
+                    self.weight_joint_gain[:, v] = self._current_visual_weight_gain(weight.float())
                     self.damping[torch.unique(iis)] = damping
 
                     if self.use_learned_imu_prediction:
@@ -3942,7 +4551,16 @@ class FactorGraph:
                     and self._outer_imu_ba_relinearization_due()
                     and aligned_for_imu
                 )
-                outer_relinearize = joint_bias_active or outer_control_active
+                full_15dof_relinearize_active = bool(
+                    self.use_full_imu_ba
+                    and self.imu_full_ba_outer_relinearize
+                    and aligned_for_imu
+                )
+                outer_relinearize = (
+                    joint_bias_active
+                    or outer_control_active
+                    or full_15dof_relinearize_active
+                )
                 if joint_bias_active:
                     self._last_joint_bias_attempt_frame = int(self.video.counter.value)
                 if outer_control_active:

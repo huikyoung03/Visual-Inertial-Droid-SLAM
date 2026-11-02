@@ -82,6 +82,9 @@ class ImuCalibration:
     source: str = "identity"
     gyro_bias: Vector3 = (0.0, 0.0, 0.0)
     acc_bias: Vector3 = (0.0, 0.0, 0.0)
+    # Per-axis correction applied as a_corrected = scale * (a_raw - bias)
+    # before device-axis and IMU-to-camera rotations.
+    accel_scale: Vector3 = (1.0, 1.0, 1.0)
     gyro_noise_density: float = 0.0
     gyro_random_walk: float = 0.0
     accel_noise_density: float = 0.0
@@ -251,6 +254,16 @@ def parse_vector3(values: Optional[Sequence[float]]) -> Vector3:
     return float(values[0]), float(values[1]), float(values[2])
 
 
+def parse_positive_scale3(values: Optional[Sequence[float]]) -> Vector3:
+    """Parse an optional multiplicative accelerometer calibration."""
+    if values is None:
+        return 1.0, 1.0, 1.0
+    scale = parse_vector3(values)
+    if not all(math.isfinite(value) and value > 0.0 for value in scale):
+        raise ValueError("accelerometer scale values must be finite and positive")
+    return scale
+
+
 def parse_matrix3(values: Optional[Sequence[float]]) -> Optional[Matrix3]:
     if values is None:
         return None
@@ -331,6 +344,7 @@ def build_imu_calibration(
     imu_to_cam_translation: Optional[Sequence[float]] = None,
     gyro_bias: Optional[Sequence[float]] = None,
     acc_bias: Optional[Sequence[float]] = None,
+    accel_scale: Optional[Sequence[float]] = None,
     gyro_noise_density: Optional[float] = None,
     gyro_random_walk: Optional[float] = None,
     accel_noise_density: Optional[float] = None,
@@ -423,6 +437,7 @@ def build_imu_calibration(
         source=source,
         gyro_bias=parse_vector3(gyro_bias),
         acc_bias=parse_vector3(acc_bias),
+        accel_scale=parse_positive_scale3(accel_scale),
         gyro_noise_density=calibrated_noise(gyro_noise_density, "gyroscope_noise_density"),
         gyro_random_walk=calibrated_noise(gyro_random_walk, "gyroscope_random_walk"),
         accel_noise_density=calibrated_noise(accel_noise_density, "accelerometer_noise_density"),
@@ -764,9 +779,18 @@ def load_imu(
             gy = get_float_any(row, ("gy", "gyro_y", "wy", "w_y", "w_RS_S_y")) - calibration.gyro_bias[1]
             gz = get_float_any(row, ("gz", "gyro_z", "wz", "w_z", "w_RS_S_z")) - calibration.gyro_bias[2]
 
-            ax = get_float_any(row, ("ax", "acc_x", "accel_x", "linear_accel_x", "a_RS_S_x")) - calibration.acc_bias[0]
-            ay = get_float_any(row, ("ay", "acc_y", "accel_y", "linear_accel_y", "a_RS_S_y")) - calibration.acc_bias[1]
-            az = get_float_any(row, ("az", "acc_z", "accel_z", "linear_accel_z", "a_RS_S_z")) - calibration.acc_bias[2]
+            ax = (
+                get_float_any(row, ("ax", "acc_x", "accel_x", "linear_accel_x", "a_RS_S_x"))
+                - calibration.acc_bias[0]
+            ) * calibration.accel_scale[0]
+            ay = (
+                get_float_any(row, ("ay", "acc_y", "accel_y", "linear_accel_y", "a_RS_S_y"))
+                - calibration.acc_bias[1]
+            ) * calibration.accel_scale[1]
+            az = (
+                get_float_any(row, ("az", "acc_z", "accel_z", "linear_accel_z", "a_RS_S_z"))
+                - calibration.acc_bias[2]
+            ) * calibration.accel_scale[2]
 
             gx, gy, gz = convert_gyro_device_to_camera(gx, gy, gz)
             ax, ay, az = convert_accel_device_to_camera(ax, ay, az)
@@ -1436,6 +1460,9 @@ def build_imu_prior(
             "acc_bias_x": f"{calibration.acc_bias[0]:.12f}",
             "acc_bias_y": f"{calibration.acc_bias[1]:.12f}",
             "acc_bias_z": f"{calibration.acc_bias[2]:.12f}",
+            "accel_scale_x": f"{calibration.accel_scale[0]:.12f}",
+            "accel_scale_y": f"{calibration.accel_scale[1]:.12f}",
+            "accel_scale_z": f"{calibration.accel_scale[2]:.12f}",
             "gyro_noise_density": f"{calibration.gyro_noise_density:.12e}",
             "gyro_random_walk": f"{calibration.gyro_random_walk:.12e}",
             "accel_noise_density": f"{calibration.accel_noise_density:.12e}",
@@ -1590,6 +1617,14 @@ def parse_args() -> argparse.Namespace:
         help="constant accelerometer bias to subtract before integration",
     )
     parser.add_argument(
+        "--accel_scale",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("SAX", "SAY", "SAZ"),
+        help="per-axis scale applied after accelerometer bias removal",
+    )
+    parser.add_argument(
         "--gyro_noise_density",
         type=float,
         default=None,
@@ -1659,6 +1694,7 @@ def main() -> None:
         imu_to_cam_translation=args.imu_to_cam_translation,
         gyro_bias=args.gyro_bias,
         acc_bias=args.acc_bias,
+        accel_scale=args.accel_scale,
         gyro_noise_density=args.gyro_noise_density,
         gyro_random_walk=args.gyro_random_walk,
         accel_noise_density=args.accel_noise_density,

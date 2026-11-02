@@ -56,11 +56,15 @@ from geom.imu_factor import (
 
     IMU_QUALITY_FEATURE_DIM,
 
+    joint_temporal_edge_support,
+
     compute_imu_adaptive_gate,
 
     edge_imu_quality_features,
 
     edge_imu_innovation_features,
+
+    edge_imu_rotation_flow_innovation,
 
     imu_center_from_pose_data,
 
@@ -620,6 +624,52 @@ class UpdateModule(nn.Module):
         )
         nn.init.zeros_(self.imu_precision_edge_fusion[-1].weight)
         nn.init.zeros_(self.imu_precision_edge_fusion[-1].bias)
+        # Joint visual--inertial factor allocation.  The direct-precision
+        # output is the calibrated R/v/p reliability of the inertial factor.
+        # This branch does *not* independently attenuate visual evidence.
+        # Instead, it predicts two logits whose softmax allocates a fixed
+        # per-edge evidence budget between DROID's visual factor and that
+        # already-calibrated IMU factor.  It reads exactly the evidence
+        # available at an update step:
+        #   ConvGRU visual state (32), IMU quality (7), R/v/p innovation (3),
+        #   correspondence correction/weight statistics (8), and the loaded
+        #   direct R/v/p IMU precision (3).
+        #
+        # Including the final term is important: a large visual--IMU
+        # innovation alone must not cause the gate to suppress a visual
+        # factor when the frozen IMU branch itself marked that interval as
+        # unreliable.  All five inputs are causal, current-BA quantities.
+        # It never sees GT or future frames.
+        self.imu_visual_joint_gate = nn.Sequential(
+            nn.LayerNorm(53),
+            nn.Linear(53, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 2),
+        )
+        # Equal logits yield [g_visual, g_imu] = [1, 1].  Therefore loading
+        # the frozen direct-R/v/p model into this new branch is exactly its
+        # original runtime until learning finds an evidence-driven relative
+        # allocation.  Unlike the former sigmoid visual-only gate, this
+        # parameterization cannot suppress both factors together.
+        nn.init.zeros_(self.imu_visual_joint_gate[-1].weight)
+        nn.init.zeros_(self.imu_visual_joint_gate[-1].bias)
+        # Persist the gate equation in checkpoints; legacy checkpoints omit
+        # this buffer and retain the historical softmax allocator (version 0).
+        self.register_buffer("joint_allocation_version", torch.tensor(0))
+        # Unlike confidence or visual-weight gating, this branch receives a
+        # physical pixel-space innovation: projected IMU rotation flow minus
+        # the current visual-pose rotation flow. It predicts a signed scalar
+        # field that converts that innovation into a correspondence correction.
+        # Exact zero initialisation preserves an older visual checkpoint until
+        # this adapter has been explicitly trained.
+        self.imu_rotation_flow_adapter = nn.Sequential(
+            nn.Conv2d(130, 64, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 1, kernel_size=1),
+            GradientClip(),
+        )
+        nn.init.zeros_(self.imu_rotation_flow_adapter[-2].weight)
+        nn.init.zeros_(self.imu_rotation_flow_adapter[-2].bias)
         # A one-sided reliability is bounded above by the physical sensor
         # covariance reference. Do *not* initialize exactly at that upper
         # boundary: the old exp(clamp(logit, max=0)) mapping gave zero
@@ -641,6 +691,69 @@ class UpdateModule(nn.Module):
         self.gru = ConvGRU(128, 128+128+64)
 
         self.agg = GraphAgg()
+        # Diagnostic only.  It is updated on the last active graph chunk and
+        # lets training logs confirm that the new visual arbitration path is
+        # learning nontrivial values.
+        self.last_joint_visual_gate = None
+        self.last_joint_imu_gate = None
+        self.joint_allocation_audit = {
+            "calls": 0, "edge_updates": 0, "supported_edge_updates": 0,
+            "supported_visual_gain_sum": 0.0, "supported_imu_gain_sum": 0.0,
+            "visual_reduced_updates": 0, "imu_reduced_updates": 0,
+        }
+
+    def configure_joint_allocation(self, reciprocal, training=False):
+        requested = int(bool(reciprocal))
+        stored = int(self.joint_allocation_version.item())
+        if stored != requested:
+            if not training or stored != 0:
+                raise ValueError(
+                    f"joint allocator checkpoint version={stored}, requested={requested}; "
+                    "use the matching training/evaluation option"
+                )
+            # Starting a new equation from a trained legacy gate would not be
+            # an identity-preserving migration. Reset only this final layer.
+            nn.init.zeros_(self.imu_visual_joint_gate[-1].weight)
+            nn.init.zeros_(self.imu_visual_joint_gate[-1].bias)
+            self.joint_allocation_version.fill_(requested)
+
+    def imu_rotation_flow_correction(
+        self,
+        net,
+        imu_rotation_flow_innovation,
+        batch,
+        num_edges,
+    ):
+        """Return a learned correction from IMU-minus-visual rotation flow.
+
+        The adapter has no manually specified IMU scale. It predicts a signed
+        per-pixel coefficient and multiplies it by the measured innovation.
+        """
+
+        flow = imu_rotation_flow_innovation.to(device=net.device, dtype=net.dtype)
+        if (
+            flow.ndim != 5
+            or flow.shape[:2] != (batch, num_edges)
+            or flow.shape[-1] != 2
+        ):
+            raise ValueError(
+                "imu_rotation_flow_innovation must be [B, E, H, W, 2], got "
+                f"{tuple(flow.shape)} for B={batch}, E={num_edges}"
+            )
+        height, width = net.shape[-2:]
+        if flow.shape[2:4] != (height, width):
+            raise ValueError(
+                "rotation-flow resolution must match ConvGRU state, got "
+                f"{tuple(flow.shape[2:4])} vs {(height, width)}"
+            )
+        flow_channels = flow.permute(0, 1, 4, 2, 3).reshape(
+            batch * num_edges, 2, height, width
+        )
+        scale = self.imu_rotation_flow_adapter(torch.cat((net, flow_channels), dim=1))
+        correction = scale * flow_channels
+        return correction.view(batch, num_edges, 2, height, width).permute(
+            0, 1, 3, 4, 2
+        )
 
 
 
@@ -748,7 +861,7 @@ class UpdateModule(nn.Module):
         return None if logits is None else torch.sigmoid(logits)
 
     @staticmethod
-    def _imu_attenuation_from_logits(logits):
+    def _imu_attenuation_from_logits(logits, minimum=0.0, maximum=1.0):
         """Map unconstrained logits to covariance-relative R/v/p weights.
 
         ``1`` is the full IMU factor defined by the propagated sensor
@@ -760,7 +873,15 @@ class UpdateModule(nn.Module):
         be distinguished during training.
         """
 
-        return torch.exp(-F.softplus(logits))
+        minimum = float(minimum)
+        maximum = float(maximum)
+        if not (0.0 <= minimum < maximum <= 1.0):
+            raise ValueError(
+                "IMU attenuation bounds must satisfy 0 <= minimum < maximum <= 1, "
+                f"got ({minimum}, {maximum})"
+            )
+        unit_attenuation = torch.exp(-F.softplus(logits))
+        return minimum + (maximum - minimum) * unit_attenuation
 
     @staticmethod
     def _validate_imu_precision_innovation(innovation, batch, edges, reference):
@@ -919,6 +1040,112 @@ class UpdateModule(nn.Module):
             raise ValueError("correspondence_features must be finite")
         return correspondence_features
 
+    def joint_visual_imu_factor_gates(
+        self,
+        net,
+        imu_quality,
+        imu_innovation,
+        correspondence_features,
+        imu_precision,
+        factor_support=None,
+    ):
+        """Return visual/IMU gains from current graph evidence.
+
+        The result is ``[B, E, 2]`` in ``[visual, IMU]`` order and satisfies
+        ``gain_visual + gain_imu == 2`` for every active graph edge.  The
+        direct R/v/p precision head still determines whether the IMU factor
+        is physically reliable; this module only learns the *relative*
+        visual--IMU allocation from causal evidence.  It never sees GT or
+        future frames. Version 1 uses reciprocal gains with product one;
+        this constrains only their geometric mean, not the Hessian scale.
+        """
+
+        if net.ndim != 5 or net.shape[2] != 128:
+            raise ValueError(
+                "net must be [B, E, 128, H, W] for joint confidence, got "
+                f"{tuple(net.shape)}"
+            )
+        batch, edges = net.shape[:2]
+        visual = self.imu_precision_visual(net.reshape(-1, *net.shape[2:]))
+        visual = visual.mean(dim=(2, 3)).view(batch, edges, -1).detach()
+        if imu_quality is None:
+            raw_quality = visual.new_zeros((batch, edges, IMU_QUALITY_FEATURE_DIM))
+        else:
+            raw_quality = imu_quality.to(device=visual.device, dtype=visual.dtype)
+            if raw_quality.ndim == 2:
+                raw_quality = raw_quality.unsqueeze(0)
+            if raw_quality.shape != (batch, edges, IMU_QUALITY_FEATURE_DIM):
+                raise ValueError(
+                    "imu_quality must be [B, E, 7] for joint confidence, got "
+                    f"{tuple(raw_quality.shape)} for B={batch}, E={edges}"
+                )
+        innovation = self._validate_imu_precision_innovation(
+            imu_innovation, batch, edges, visual
+        )
+        evidence = self._validate_imu_precision_edge_features(
+            correspondence_features, batch, edges, visual
+        )
+        if evidence is None:
+            evidence = visual.new_zeros((batch, edges, 8))
+        precision = imu_precision.to(device=visual.device, dtype=visual.dtype)
+        if precision.ndim == 5:
+            if precision.shape[2:] != (1, 1, 3):
+                raise ValueError(
+                    "imu_precision 5D shape must end in [1, 1, 3], got "
+                    f"{tuple(precision.shape)}"
+                )
+            precision = precision[..., 0, 0, :]
+        if precision.ndim != 3 or precision.shape != (batch, edges, 3):
+            raise ValueError(
+                "imu_precision must be [B, E, 3] for joint confidence, got "
+                f"{tuple(precision.shape)} for B={batch}, E={edges}"
+            )
+        if not torch.isfinite(precision).all():
+            raise ValueError("imu_precision must be finite for joint confidence")
+        logits = self.imu_visual_joint_gate(
+            torch.cat(
+                (
+                    visual,
+                    raw_quality.detach(),
+                    innovation.detach(),
+                    evidence,
+                    precision.detach(),
+                ),
+                dim=-1,
+            )
+        )
+        if int(self.joint_allocation_version.item()) == 1:
+            if factor_support is None or factor_support.shape != (batch, edges):
+                raise ValueError("reciprocal allocation needs [B,E] IMU factor support")
+            # Smooth, unbounded log-ratio: no hand-selected confidence range.
+            # asinh slows growth for numerical stability without a hard cap.
+            # The learned direct precision provides continuous IMU support;
+            # it is a learned surrogate, not a calibrated probability.
+            support = factor_support.to(device=visual.device, dtype=torch.bool)
+            log_ratio = torch.asinh((logits[..., 1] - logits[..., 0]).float())
+            log_ratio = log_ratio * precision.detach().float().mean(dim=-1)
+            log_ratio = torch.where(support, log_ratio, torch.zeros_like(log_ratio))
+            gains = torch.stack((torch.exp(-0.5 * log_ratio), torch.exp(0.5 * log_ratio)), dim=-1)
+            if not torch.isfinite(gains).all():
+                raise FloatingPointError("non-finite reciprocal visual/IMU gain")
+            if not self.training:
+                audit = self.joint_allocation_audit
+                audit["calls"] += 1
+                audit["edge_updates"] += support.numel()
+                audit["supported_edge_updates"] += int(support.sum())
+                active = gains.detach()[support]
+                audit["supported_visual_gain_sum"] += float(active[:, 0].sum())
+                audit["supported_imu_gain_sum"] += float(active[:, 1].sum())
+                audit["visual_reduced_updates"] += int((active[:, 0] < 1).sum())
+                audit["imu_reduced_updates"] += int((active[:, 1] < 1).sum())
+            # gV*gI=1 preserves the geometric mean of the *multipliers*, not
+            # total information/Hessian scale. Physical factor weights differ.
+            return gains
+        # Multiplying the two-way softmax by two makes zero initialization an
+        # exact identity for *both* factors.  No global IMU lambda, runtime
+        # threshold, floor, or manually selected factor scale is introduced.
+        return 2.0 * torch.softmax(logits, dim=-1)
+
     def imu_precision_weights(
         self,
         net,
@@ -927,6 +1154,8 @@ class UpdateModule(nn.Module):
         visual_quality=None,
         correspondence_features=None,
         imu_discrepancy=None,
+        minimum=0.0,
+        maximum=1.0,
     ):
         """Return learned [rotation, velocity, position] IMU attenuation.
 
@@ -990,13 +1219,17 @@ class UpdateModule(nn.Module):
                 dim=-1,
             )
             logits = logits + self.imu_precision_edge_fusion(edge_input)
-        return self._imu_attenuation_from_logits(logits)
+        return self._imu_attenuation_from_logits(
+            logits, minimum=minimum, maximum=maximum
+        )
 
     def imu_precision_quality_weights(
         self,
         imu_quality,
         imu_innovation=None,
         imu_discrepancy=None,
+        minimum=0.0,
+        maximum=1.0,
     ):
         """Return quality-only attenuation for valid rows without visual edges."""
 
@@ -1028,7 +1261,9 @@ class UpdateModule(nn.Module):
             quality,
         )
         logits = logits + self.imu_precision_innovation(innovation)
-        return self._imu_attenuation_from_logits(logits)
+        return self._imu_attenuation_from_logits(
+            logits, minimum=minimum, maximum=maximum
+        )
 
 
     def forward(
@@ -1045,10 +1280,20 @@ class UpdateModule(nn.Module):
         use_dvi_imu_confidence=False,
         use_dvi_imu_quality_fusion=False,
         imu_quality=None,
+        imu_precision_override=None,
         imu_innovation=None,
         use_imu_precision_visual_innovation=False,
         use_imu_precision_edge_fusion=False,
         imu_discrepancy=None,
+        use_joint_visual_imu_confidence=False,
+        joint_imu_innovation=None,
+        joint_factor_support=None,
+        imu_joint_confidence_min=0.0,
+        imu_joint_confidence_max=1.0,
+        imu_joint_visual_gate_min=0.0,
+        return_joint_visual_gate=False,
+        use_imu_rotation_flow_adapter=False,
+        imu_rotation_flow_innovation=None,
     ):
 
         """ RaftSLAM update operator """
@@ -1090,6 +1335,12 @@ class UpdateModule(nn.Module):
         delta = self.delta(net).view(*output_dim)
 
         weight = self.weight(net).view(*output_dim)
+        self.last_joint_visual_gate = None
+        self.last_joint_imu_gate = None
+        # Runtime diagnostics use detached gains. Paired training requests
+        # live tensors for audits; gradients come from post-BA pose losses.
+        visual_gate = None
+        joint_factor_gates = None
 
         if use_learned_imu_precision:
             visual_quality = (
@@ -1099,18 +1350,70 @@ class UpdateModule(nn.Module):
             )
             correspondence_features = (
                 self._visual_correspondence_features(delta, weight, batch, num)
-                if use_imu_precision_edge_fusion
+                if (use_imu_precision_edge_fusion or use_joint_visual_imu_confidence)
                 else None
             )
-            imu_confidence = self.imu_precision_weights(
-                net.view(batch, num, -1, ht, wd),
-                imu_quality=imu_quality,
-                imu_discrepancy=imu_discrepancy,
-                imu_innovation=imu_innovation,
-                visual_quality=visual_quality,
-                correspondence_features=correspondence_features,
-            )
+            if imu_precision_override is None:
+                imu_confidence = self.imu_precision_weights(
+                    net.view(batch, num, -1, ht, wd),
+                    imu_quality=imu_quality,
+                    imu_discrepancy=imu_discrepancy,
+                    imu_innovation=imu_innovation,
+                    visual_quality=visual_quality,
+                    correspondence_features=correspondence_features,
+                    minimum=0.0,
+                    maximum=1.0,
+                )
+            else:
+                # Legacy paired visual-corruption training preserves the exact
+                # clean IMU R/v/p precision.  Otherwise a frozen direct head
+                # could still change its output because it reads ConvGRU
+                # visual features. Reciprocal training leaves the override
+                # unset and recomputes precision exactly as inference does.
+                imu_confidence = imu_precision_override.to(
+                    device=net.device,
+                    dtype=net.dtype,
+                )
+                if imu_confidence.ndim == 5:
+                    if imu_confidence.shape[2:] != (1, 1, 3):
+                        raise ValueError(
+                            "imu_precision_override 5D shape must end in "
+                            f"[1, 1, 3], got {tuple(imu_confidence.shape)}"
+                        )
+                    imu_confidence = imu_confidence[..., 0, 0, :]
+                if imu_confidence.ndim != 3 or imu_confidence.shape != (batch, num, 3):
+                    raise ValueError(
+                        "imu_precision_override must be [B, E, 3] or "
+                        "[B, E, 1, 1, 3], got "
+                        f"{tuple(imu_confidence.shape)} for B={batch}, E={num}"
+                    )
+                if not torch.isfinite(imu_confidence).all():
+                    raise ValueError("imu_precision_override must be finite")
+            # Keep the [B, E, 3] direct precision available to the joint
+            # allocator.  The allocator may read it, but cannot change the
+            # frozen direct R/v/p head itself.  It is also returned intact in
+            # paired training so the corrupted visual pass does not inherit a
+            # clean allocation and apply allocation twice.
+            imu_precision_for_joint_gate = imu_confidence
             imu_confidence = imu_confidence.unsqueeze(2).unsqueeze(2)
+            if use_joint_visual_imu_confidence:
+                factor_gates = self.joint_visual_imu_factor_gates(
+                    net.view(batch, num, -1, ht, wd),
+                    imu_quality=imu_quality,
+                    imu_innovation=joint_imu_innovation,
+                    correspondence_features=correspondence_features,
+                    imu_precision=imu_precision_for_joint_gate,
+                    factor_support=joint_factor_support,
+                )
+                joint_factor_gates = factor_gates
+                visual_gate = factor_gates[..., :1]
+                imu_gate = factor_gates[..., 1:]
+                self.last_joint_visual_gate = visual_gate.detach()
+                self.last_joint_imu_gate = imu_gate.detach()
+                weight = weight * visual_gate.view(batch, num, 1, 1, 1)
+                # Retain the component-wise physical R/v/p precision and
+                # apply only the learned *relative* modality allocation.
+                imu_confidence = imu_confidence * imu_gate.unsqueeze(2).unsqueeze(2)
         elif return_component_imu_confidence:
             component_logits = self.imu_component_confidence(net).view(*output_dim)
             component_logits = component_logits.permute(0, 1, 3, 4, 2).contiguous()
@@ -1165,6 +1468,19 @@ class UpdateModule(nn.Module):
 
         delta = delta.permute(0,1,3,4,2)[...,:2].contiguous()
 
+        if use_imu_rotation_flow_adapter:
+            if imu_rotation_flow_innovation is None:
+                raise ValueError(
+                    "use_imu_rotation_flow_adapter requires "
+                    "imu_rotation_flow_innovation"
+                )
+            delta = delta + self.imu_rotation_flow_correction(
+                net,
+                imu_rotation_flow_innovation,
+                batch,
+                num,
+            )
+
         weight = weight.permute(0,1,3,4,2)[...,:2].contiguous()
 
         if not (return_component_imu_confidence or use_learned_imu_precision):
@@ -1182,6 +1498,11 @@ class UpdateModule(nn.Module):
 
             if return_imu_confidence:
 
+                if return_joint_visual_gate:
+                    return (
+                        net, delta, weight, eta, upmask, imu_confidence,
+                        joint_factor_gates, imu_precision_for_joint_gate,
+                    )
                 return net, delta, weight, eta, upmask, imu_confidence
 
             return net, delta, weight, eta, upmask
@@ -1192,6 +1513,11 @@ class UpdateModule(nn.Module):
 
             if return_imu_confidence:
 
+                if return_joint_visual_gate:
+                    return (
+                        net, delta, weight, imu_confidence, joint_factor_gates,
+                        imu_precision_for_joint_gate,
+                    )
                 return net, delta, weight, imu_confidence
 
             return net, delta, weight
@@ -1243,6 +1569,14 @@ class DroidNet(nn.Module):
         # log-domain parameter를 Softplus로 양수 weight로 변환한다.
         self.imu_ba_log_weight = nn.Parameter(torch.tensor(-3.0))
 
+        # R/v/p global cross-modal calibration. This is deliberately
+        # separate from the per-interval confidence: alpha calibrates the
+        # dataset-level visual/IMU normal-system units, while confidence
+        # handles interval-level IMU reliability. It is inactive unless the
+        # corresponding explicit runtime flag is set, preserving old models.
+        # The component order is [rotation, velocity, position].
+        self.imu_cross_modal_log_precision = nn.Parameter(torch.zeros(3))
+
         # Data-derived scale for the pre-BA visual/IMU calibration loss. This
         # is deliberately not a BA factor multiplier or a fixed confidence
         # schedule; it merely makes the pose/IMU energy dimensionless while
@@ -1284,6 +1618,15 @@ class DroidNet(nn.Module):
     def get_imu_ba_weight(self):
 
         return F.softplus(self.imu_ba_log_weight)
+
+    def get_imu_cross_modal_calibration(self):
+        """Return positive R/v/p information multipliers, initialized to one.
+
+        Bounds are numerical safeguards only (not chosen factor weights): the
+        model learns the value in log-information space from post-BA pose loss.
+        """
+
+        return torch.exp(self.imu_cross_modal_log_precision.clamp(-8.0, 10.0))
 
 
 
@@ -1408,9 +1751,13 @@ class DroidNet(nn.Module):
 
         use_learned_imu_precision=False,
 
+        use_learned_imu_cross_modal_calibration=False,
+
         use_dvi_imu_confidence=False,
 
         use_dvi_imu_quality_fusion=False,
+
+        joint_imu_precision_override=None,
 
         use_imu_precision_discrepancy=False,
 
@@ -1420,11 +1767,29 @@ class DroidNet(nn.Module):
 
         use_imu_precision_edge_fusion=False,
 
+        use_joint_visual_imu_confidence=False,
+
+        joint_visual_imu_full_stage_only=False,
+
+        imu_joint_confidence_min=0.0,
+
+        imu_joint_confidence_max=1.0,
+
+        imu_joint_visual_gate_min=0.0,
+
+        return_joint_visual_gate=False,
+
+        use_imu_rotation_flow_adapter=False,
+
+        imu_rotation_flow_adapter_full_stage_only=False,
+
         use_full_imu_ba=False,
 
         imu_pose_only_steps=0,
 
         imu_full_stage_schedule=None,
+
+        imu_train_max_dt=None,
 
         imu_full_pos_weight=0.05,
 
@@ -1530,6 +1895,19 @@ class DroidNet(nn.Module):
         # imu_delta가 전달된 경우 visual-only BA가 아니라 IMU factor도 활성화
         use_imu_ba = imu_delta is not None
 
+        # The correspondence adapter needs only a valid preintegrated rotation.
+        # ``imu_rotation_flow_adapter_full_stage_only`` is the runtime-matched
+        # policy: do not alter visual-only preconditioning correspondences;
+        # activate it only in a full 15DoF DBA unroll.  The old behaviour stays
+        # available for historical checkpoint reproduction.
+        use_imu_rotation_flow_adapter = bool(
+            use_imu_rotation_flow_adapter and use_imu_ba
+        )
+        imu_rotation_flow_adapter_full_stage_only = bool(
+            imu_rotation_flow_adapter_full_stage_only
+            and use_imu_rotation_flow_adapter
+        )
+
         use_component_imu_confidence = bool(
             use_component_imu_confidence and (return_imu_confidence or use_imu_ba)
         )
@@ -1549,6 +1927,40 @@ class DroidNet(nn.Module):
         use_imu_precision_edge_fusion = bool(
             use_imu_precision_edge_fusion and use_imu_precision_innovation
         )
+        use_joint_visual_imu_confidence = bool(
+            use_joint_visual_imu_confidence and use_learned_imu_precision
+        )
+        if use_joint_visual_imu_confidence and int(self.update.joint_allocation_version) == 1:
+            if imu_delta is None or imu_valid is None:
+                raise ValueError("reciprocal training requires IMU rows and validity")
+            # Use the requested training factor-duration limit for both BA
+            # and the joint gate. The legacy default remains 0.5 seconds.
+            dt = imu_delta[..., 0]
+            max_dt = 0.5 if imu_train_max_dt is None else float(imu_train_max_dt)
+            imu_valid = (
+                imu_valid.bool()
+                & torch.isfinite(imu_delta).all(dim=-1)
+                & (dt > 1e-6)
+                & ((dt <= max_dt) if max_dt > 0.0 else torch.ones_like(dt, dtype=torch.bool))
+            )
+        joint_visual_imu_full_stage_only = bool(
+            joint_visual_imu_full_stage_only and use_joint_visual_imu_confidence
+        )
+        return_joint_visual_gate = bool(
+            return_joint_visual_gate and use_joint_visual_imu_confidence
+        )
+        if joint_imu_precision_override is not None:
+            if not return_joint_visual_gate:
+                raise ValueError(
+                    "joint_imu_precision_override requires "
+                    "return_joint_visual_gate=True"
+                )
+            if len(joint_imu_precision_override) != int(num_steps):
+                raise ValueError(
+                    "joint_imu_precision_override must provide one edge "
+                    f"precision tensor per unroll: expected {num_steps}, got "
+                    f"{len(joint_imu_precision_override)}"
+                )
         if use_learned_imu_precision:
             # Direct precision is a distinct factor parameterization; never
             # compose it with a sigmoid confidence branch.
@@ -1613,6 +2025,8 @@ class DroidNet(nn.Module):
         Gs_list, disp_list, residual_list = [], [], []
 
         imu_confidence_list, imu_adaptive_gate_list, imu_motion_list = [], [], []
+        joint_visual_gate_list = []
+        joint_imu_precision_list = []
         imu_edge_quality = (
             edge_imu_quality_features(
                 imu_delta,
@@ -1662,8 +2076,13 @@ class DroidNet(nn.Module):
                 if (
                     use_imu_precision_discrepancy
                     or use_imu_precision_innovation
+                    or use_joint_visual_imu_confidence
                 )
-                else self.update.imu_precision_quality_weights(imu_temporal_quality)
+                else self.update.imu_precision_quality_weights(
+                    imu_temporal_quality,
+                    minimum=0.0,
+                    maximum=1.0,
+                )
             )
         else:
             imu_quality_fallback = self.update.dvi_imu_quality_confidence(
@@ -1673,12 +2092,32 @@ class DroidNet(nn.Module):
         # DROID는 한 번에 pose를 예측하지 않고 ConvGRU -> BA를 여러 번 unroll한다.
         for step in range(num_steps):
 
+            step_imu_precision_override = (
+                joint_imu_precision_override[step]
+                if joint_imu_precision_override is not None
+                else None
+            )
+
             step_use_full_imu_ba = full_imu_schedule[step]
+            step_use_joint_visual_imu_confidence = bool(
+                use_joint_visual_imu_confidence
+                and (
+                    not joint_visual_imu_full_stage_only
+                    or step_use_full_imu_ba
+                )
+            )
             # A pose-only prefix must be genuinely visual-only: passing
             # imu_delta to BA would otherwise activate the legacy rotation
             # factor even while full IMU BA is disabled for this step.
             step_use_imu_ba = use_imu_ba and (
                 not use_full_imu_ba or step_use_full_imu_ba
+            )
+            step_use_imu_rotation_flow_adapter = bool(
+                use_imu_rotation_flow_adapter
+                and (
+                    not imu_rotation_flow_adapter_full_stage_only
+                    or step_use_full_imu_ba
+                )
             )
 
             Gs = Gs.detach()
@@ -1735,8 +2174,13 @@ class DroidNet(nn.Module):
 
             imu_edge_discrepancy = None
             imu_edge_innovation = None
+            imu_edge_joint_innovation = None
             step_imu_quality_fallback = imu_quality_fallback
-            if use_imu_precision_discrepancy or use_imu_precision_innovation:
+            if (
+                use_imu_precision_discrepancy
+                or use_imu_precision_innovation
+                or step_use_joint_visual_imu_confidence
+            ):
                 temporal_discrepancy = temporal_imu_visual_innovation_features(
                     Gs.data.detach(),
                     imu_delta,
@@ -1762,6 +2206,10 @@ class DroidNet(nn.Module):
                     imu_edge_innovation = edge_imu_innovation_features(
                         temporal_discrepancy, ii, jj
                     )
+                if step_use_joint_visual_imu_confidence:
+                    imu_edge_joint_innovation = edge_imu_innovation_features(
+                        temporal_discrepancy, ii, jj
+                    )
                 if imu_temporal_quality is not None:
                     step_imu_quality_fallback = self.update.imu_precision_quality_weights(
                         imu_temporal_quality,
@@ -1775,6 +2223,8 @@ class DroidNet(nn.Module):
                             if use_imu_precision_innovation
                             else None
                         ),
+                        minimum=0.0,
+                        maximum=1.0,
                     )
 
 
@@ -1805,6 +2255,8 @@ class DroidNet(nn.Module):
 
                 imu_quality=imu_edge_quality,
 
+                imu_precision_override=step_imu_precision_override,
+
                 imu_discrepancy=imu_edge_discrepancy,
 
                 imu_innovation=imu_edge_innovation,
@@ -1815,13 +2267,71 @@ class DroidNet(nn.Module):
 
                 use_imu_precision_edge_fusion=use_imu_precision_edge_fusion,
 
+                use_joint_visual_imu_confidence=(
+                    step_use_joint_visual_imu_confidence
+                ),
+
+                joint_imu_innovation=imu_edge_joint_innovation,
+
+                joint_factor_support=(
+                    joint_temporal_edge_support(
+                        imu_delta, imu_valid, ii, jj,
+                        max_dt=(0.5 if imu_train_max_dt is None else float(imu_train_max_dt)),
+                    )
+                    if step_use_joint_visual_imu_confidence
+                    and int(self.update.joint_allocation_version.item()) == 1
+                    else None
+                ),
+
+                imu_joint_confidence_min=imu_joint_confidence_min,
+
+                imu_joint_confidence_max=imu_joint_confidence_max,
+
+                imu_joint_visual_gate_min=imu_joint_visual_gate_min,
+
+                return_joint_visual_gate=return_joint_visual_gate,
+
+                use_imu_rotation_flow_adapter=step_use_imu_rotation_flow_adapter,
+
+                imu_rotation_flow_innovation=(
+                    edge_imu_rotation_flow_innovation(
+                        Gs.data.detach(),
+                        imu_delta,
+                        intrinsics,
+                        ii,
+                        jj,
+                        height=coords1.shape[2],
+                        width=coords1.shape[3],
+                        imu_valid=imu_valid,
+                        imu_bias_jacobian=imu_bias_jacobian,
+                        gyro_bias=self.imu_gyro_bias.detach(),
+                        local_gyro_bias=(
+                            imu_motion.detach()[..., 6:9]
+                            if imu_motion is not None and imu_motion.shape[-1] >= 9
+                            else None
+                        ),
+                        compose_order=imu_full_compose_order,
+                        inverse_imu=imu_full_inverse,
+                    )
+                    if step_use_imu_rotation_flow_adapter
+                    else None
+                ),
+
             )
 
 
 
             if return_imu_confidence or step_use_imu_ba:
 
-                net, delta, weight, eta, upmask, imu_edge_confidence = update_out
+                if return_joint_visual_gate:
+                    (
+                        net, delta, weight, eta, upmask, imu_edge_confidence,
+                        joint_visual_gate, joint_direct_imu_precision,
+                    ) = update_out
+                else:
+                    net, delta, weight, eta, upmask, imu_edge_confidence = update_out
+                    joint_visual_gate = None
+                    joint_direct_imu_precision = None
 
                 if use_learned_imu_precision:
                     imu_confidence = temporal_imu_precision_from_edges(
@@ -1833,6 +2343,9 @@ class DroidNet(nn.Module):
                             step_imu_quality_fallback
                             if step_imu_quality_fallback is not None
                             else 1.0
+                        ),
+                        allow_factor_amplification=(
+                            step_use_joint_visual_imu_confidence
                         ),
                     )
                 else:
@@ -2023,6 +2536,12 @@ class DroidNet(nn.Module):
 
                     use_learned_imu_precision=use_learned_imu_precision,
 
+                    imu_cross_modal_calibration=(
+                        self.get_imu_cross_modal_calibration()
+                        if use_learned_imu_cross_modal_calibration
+                        else None
+                    ),
+
                     imu_optimize_bias=imu_optimize_bias,
 
                     use_imu_bias_random_walk=use_imu_bias_random_walk,
@@ -2057,6 +2576,25 @@ class DroidNet(nn.Module):
 
                 imu_confidence_list.append(imu_confidence)
 
+            # A full-stage-only joint allocator intentionally yields fewer
+            # visual-gain tensors (only the full 15DoF steps), but the paired
+            # corrupted pass still executes every unroll. Preserve the
+            # *pre-allocation* direct R/v/p precision for every step: the
+            # second pass must reproduce the frozen physical IMU reliability,
+            # then infer its own visual/IMU allocation from corrupted images.
+            if return_joint_visual_gate:
+
+                if joint_direct_imu_precision is None:
+                    raise RuntimeError(
+                        "joint allocator must return pre-allocation direct "
+                        "IMU precision for paired training"
+                    )
+                joint_imu_precision_list.append(joint_direct_imu_precision.detach())
+
+                if joint_visual_gate is not None:
+
+                    joint_visual_gate_list.append(joint_visual_gate)
+
             if imu_adaptive_gate is not None:
 
                 imu_adaptive_gate_list.append(imu_adaptive_gate)
@@ -2081,6 +2619,39 @@ class DroidNet(nn.Module):
             if return_imu_motion:
 
                 out.append(imu_motion_list)
+
+            if return_joint_visual_gate:
+
+                # This contract is consumed by the paired corrupted forward:
+                # direct precision is indexed by *every* unroll while visual
+                # gates exist only on stages where they were enabled.
+                expected_precision_steps = len(full_imu_schedule)
+                expected_gate_steps = sum(
+                    1
+                    for is_full in full_imu_schedule
+                    if (
+                        use_joint_visual_imu_confidence
+                        and (
+                            not joint_visual_imu_full_stage_only
+                            or is_full
+                        )
+                    )
+                )
+                if len(joint_imu_precision_list) != expected_precision_steps:
+                    raise RuntimeError(
+                        "joint precision override contract violated: expected "
+                        f"{expected_precision_steps} tensors, got "
+                        f"{len(joint_imu_precision_list)}"
+                    )
+                if len(joint_visual_gate_list) != expected_gate_steps:
+                    raise RuntimeError(
+                        "joint visual-gate contract violated: expected "
+                        f"{expected_gate_steps} tensors, got "
+                        f"{len(joint_visual_gate_list)}"
+                    )
+
+                out.append(joint_visual_gate_list)
+                out.append(joint_imu_precision_list)
 
             return tuple(out)
 

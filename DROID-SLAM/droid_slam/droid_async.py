@@ -4,7 +4,7 @@ import numpy as np
 
 import time
 from lietorch import SE3
-from droid_net import DroidNet
+from droid_net import DroidNet, upgrade_direct_precision_quality_checkpoint
 from depth_video import DepthVideo
 from motion_filter import MotionFilter
 from droid_frontend import DroidFrontend
@@ -28,6 +28,11 @@ def load_network(weights, device="cuda:0"):
     )
 
     model_state = net.state_dict()
+    if upgrade_direct_precision_quality_checkpoint(state_dict, model_state):
+        print(
+            "[CKPT] expanded direct IMU-quality input 7D -> 10D; "
+            "new discrepancy columns are zero-initialized"
+        )
     incompatible = [
         key for key, value in state_dict.items()
         if key in model_state and value.shape != model_state[key].shape
@@ -57,6 +62,8 @@ def backend_process(args, depth_video1, depth_video2, device="cuda"):
 
     with torch.no_grad():
         net = load_network(args.weights, device=device)
+        if getattr(args, "use_joint_visual_imu_confidence", False):
+            net.update.configure_joint_allocation(getattr(args, "joint_visual_imu_reciprocal", False))
         if getattr(args, "use_dvi_imu_quality_fusion", False):
             loaded_keys = getattr(net, "_loaded_state_keys", set())
             has_dvi_quality_head = any(
@@ -211,6 +218,8 @@ class DroidAsync:
         )
 
         net = load_network(args.weights, device=self.frontend_device)
+        if getattr(args, "use_joint_visual_imu_confidence", False):
+            net.update.configure_joint_allocation(getattr(args, "joint_visual_imu_reciprocal", False))
         if getattr(args, "use_dvi_imu_quality_fusion", False):
             loaded_keys = getattr(net, "_loaded_state_keys", set())
             has_dvi_quality_head = any(

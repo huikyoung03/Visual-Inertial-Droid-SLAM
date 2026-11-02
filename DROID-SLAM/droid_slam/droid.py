@@ -104,6 +104,10 @@ class Droid:
 
         # 실행 옵션 저장
         self.args = args
+        if getattr(args, "use_joint_visual_imu_confidence", False):
+            self.net.update.configure_joint_allocation(
+                getattr(args, "joint_visual_imu_reciprocal", False)
+            )
         if getattr(self.args, "use_component_imu_confidence", False):
             loaded_keys = getattr(self.net, "_loaded_state_keys", set())
             has_component_head = (

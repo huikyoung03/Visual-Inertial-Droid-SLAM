@@ -230,6 +230,12 @@ def resolve_runtime_imu_calibration(args):
             imu_sensor_yaml=args.imu_sensor_yaml,
             imu_to_cam_rotation=args.imu_to_cam_rotation,
             imu_to_cam_translation=args.imu_to_cam_translation,
+            gyro_bias=args.gyro_bias,
+            acc_bias=args.acc_bias,
+            gyro_noise_density=args.gyro_noise_density,
+            gyro_random_walk=args.gyro_random_walk,
+            accel_noise_density=args.accel_noise_density,
+            accel_random_walk=args.accel_random_walk,
         )
     except Exception as exc:
         print(f"[IMU WARNING] failed to resolve runtime calibration: {exc}")
@@ -593,6 +599,10 @@ def maybe_build_imu_prior_from_raw(args):
         imu_to_cam_translation=args.imu_to_cam_translation,
         gyro_bias=args.gyro_bias,
         acc_bias=args.acc_bias,
+        gyro_noise_density=args.gyro_noise_density,
+        gyro_random_walk=args.gyro_random_walk,
+        accel_noise_density=args.accel_noise_density,
+        accel_random_walk=args.accel_random_walk,
     )
 
     return output
@@ -845,7 +855,18 @@ def apply_euroc_original_protocol(args):
     if not getattr(args, "euroc_original_protocol", False):
         return
 
-    args.stride = 2
+    # The published EuRoC visual protocol uses a 20 Hz cam0 stream with
+    # tracking stride 2.  Preserve that default, while allowing an explicit
+    # input-rate ablation to retain *all other* protocol settings unchanged.
+    # This prevents a CLI --stride value from being silently overwritten.
+    protocol_stride = getattr(args, "euroc_protocol_tracking_stride", None)
+    if protocol_stride is None:
+        protocol_stride = 2
+    if int(protocol_stride) < 1:
+        raise ValueError(
+            "--euroc_protocol_tracking_stride must be a positive integer"
+        )
+    args.stride = int(protocol_stride)
     args.trajectory_fill_stride = 1
     # Manifest-only mode bypasses the frontend/backend on purpose, so it also
     # bypasses the normal keyframe retirement that keeps an online DROID run
@@ -867,7 +888,7 @@ def apply_euroc_original_protocol(args):
     args.backend_nms = 2
     print(
         "[EuRoC ORIGINAL PROTOCOL] rectified_cam0=752x480->320x512, "
-        f"track_stride=2, fill_stride=1, buffer={args.buffer}, filter=2.4, warmup=15, "
+        f"track_stride={args.stride}, fill_stride=1, buffer={args.buffer}, filter=2.4, warmup=15, "
         "keyframe=3.0, frontend=(17.5,20,2,1), backend=(24.0,2,2)"
     )
 
@@ -1003,6 +1024,9 @@ def _reconstruction_input_provenance(args):
         "stride": stride,
         "max_frames": max_frames,
         "euroc_original_protocol": euroc_original_protocol,
+        "motion_filter_max_imu_gap_sec": float(
+            getattr(args, "motion_filter_max_imu_gap_sec", 0.0)
+        ),
         # A local-only reconstruction deliberately stops before DROID's
         # termination-time backend and PoseTrajectoryFiller. Persist this so
         # it cannot later be mistaken for a paper-facing dense SLAM result.
@@ -1225,6 +1249,15 @@ def save_reconstruction(
         # Named snapshots isolate scale changes caused by VI initialization,
         # local tracking, and the two offline backend passes.
         "imu_state_diagnostics": state_diagnostics,
+        "motion_filter_max_imu_gap_sec": float(
+            getattr(video, "motion_filter_max_imu_gap_sec", 0.0)
+        ),
+        "motion_filter_imu_gap_forced_count": int(
+            getattr(video, "motion_filter_imu_gap_forced_count", 0)
+        ),
+        "frontend_imu_gap_removal_prevented": int(
+            getattr(video, "frontend_imu_gap_removal_prevented", 0)
+        ),
         # Input provenance lets a later held-out evaluation prove that every
         # reused reconstruction came from the requested sequence and sampling.
         "input_provenance": input_provenance,
@@ -1253,6 +1286,15 @@ def save_reconstruction(
     # 4. torch save
     ############################################################
 
+    update = getattr(getattr(droid, "net", None), "update", None)
+    if update is not None and int(getattr(update, "joint_allocation_version", 0)) == 1:
+        audit = dict(update.joint_allocation_audit)
+        count = audit["supported_edge_updates"]
+        audit["mean_supported_visual_gain"] = audit["supported_visual_gain_sum"] / max(count, 1)
+        audit["mean_supported_imu_gain"] = audit["supported_imu_gain_sum"] / max(count, 1)
+        save_data["joint_allocation_version"] = 1
+        save_data["joint_allocation_audit"] = audit
+        print(f"[JOINT-AUDIT] {audit}")
     torch.save(save_data, save_path)
 
 
@@ -1327,6 +1369,16 @@ if __name__ == '__main__':
             "and the published frontend/backend settings"
         ),
     )
+    parser.add_argument(
+        "--euroc_protocol_tracking_stride",
+        type=int,
+        default=None,
+        help=(
+            "explicit tracking stride inside --euroc_original_protocol; "
+            "default is the published value 2. Use only for controlled "
+            "input-rate ablations, e.g. 1 for raw 20 Hz cam0 input."
+        ),
+    )
 
     # visualization 비활성화 옵션
     parser.add_argument("--disable_vis", action="store_true")
@@ -1351,6 +1403,15 @@ if __name__ == '__main__':
         type=float,
         default=2.4,
         help="how much motion before considering new keyframe"
+    )
+    parser.add_argument(
+        "--motion_filter_max_imu_gap_sec",
+        type=float,
+        default=0.0,
+        help=(
+            "optional maximum composed IMU duration between MotionFilter "
+            "keyframes; zero preserves visual-only selection exactly"
+        ),
     )
     parser.add_argument(
         "--motion_filter_manifest_out",
@@ -1509,6 +1570,30 @@ if __name__ == '__main__':
     )
     parser.add_argument("--gyro_bias", type=float, nargs=3, default=None, metavar=("BX", "BY", "BZ"))
     parser.add_argument("--acc_bias", type=float, nargs=3, default=None, metavar=("BX", "BY", "BZ"))
+    parser.add_argument(
+        "--gyro_noise_density",
+        type=float,
+        default=None,
+        help="calibrated gyro noise density used when validating/weighting imu_prior.csv",
+    )
+    parser.add_argument(
+        "--gyro_random_walk",
+        type=float,
+        default=None,
+        help="calibrated gyro bias random walk used when validating imu_prior.csv",
+    )
+    parser.add_argument(
+        "--accel_noise_density",
+        type=float,
+        default=None,
+        help="calibrated accelerometer noise density used when validating/weighting imu_prior.csv",
+    )
+    parser.add_argument(
+        "--accel_random_walk",
+        type=float,
+        default=None,
+        help="calibrated accelerometer bias random walk used when validating imu_prior.csv",
+    )
     parser.add_argument("--use_imu_filter", action="store_true", help="use IMU rotation to keep rotating frames")
     parser.add_argument("--force_all_frames", action="store_true", help="append every frame without motion filtering")
     parser.add_argument("--imu_rot_thresh", type=float, default=0.035, help="IMU rotation threshold in radians")
@@ -1911,6 +1996,15 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
+        "--imu_full_ba_outer_relinearize",
+        action="store_true",
+        help=(
+            "full 15DoF only: rebuild the nonlinear IMU prior after every "
+            "CUDA DBA step. This is compatible with --use_two_stage_imu_ba "
+            "and remains inactive during its visual-only stage."
+        ),
+    )
+    parser.add_argument(
         "--imu_ba_outer_relinearize_interval",
         type=int,
         default=10,
@@ -1925,6 +2019,30 @@ if __name__ == '__main__':
     parser.add_argument("--imu_ba_debug", action="store_true", help="write full IMU BA prior debug csv")
     parser.add_argument("--imu_ba_debug_path", type=str, default=None, help="optional path for full IMU BA prior debug csv")
     parser.add_argument("--imu_ba_debug_max_rows", type=int, default=20000, help="max full IMU BA debug rows to keep in memory")
+    parser.add_argument(
+        "--imu_state_update_audit_path",
+        type=str,
+        default=None,
+        help=(
+            "optional CSV path recording the pose, velocity, and local-bias "
+            "change from every full 15DoF BA call; does not alter BA"
+        ),
+    )
+    parser.add_argument(
+        "--imu_influence_audit_path",
+        type=str,
+        default=None,
+        help=(
+            "optional CSV path for one global-window visual-vs-IMU normal-system "
+            "diagnostic; does not alter BA"
+        ),
+    )
+    parser.add_argument(
+        "--imu_influence_audit_min_window",
+        type=int,
+        default=128,
+        help="minimum BA window size for the visual-vs-IMU influence diagnostic",
+    )
     parser.add_argument("--use_imu_residual", action="store_true", help="apply rotation-only inertial residual after visual DBA")
     parser.add_argument("--imu_residual_weight", type=float, default=0.02, help="base alpha for rotation-only inertial residual")
     parser.add_argument("--imu_residual_window", type=int, default=12, help="recent keyframe window for inertial residual")
@@ -1944,6 +2062,14 @@ if __name__ == '__main__':
         help=(
             "learn covariance-relative GRU+IMU-quality R/v/p IMU attenuation; "
             "uses no global IMU lambda or fixed R/v/p compatibility weights"
+        ),
+    )
+    parser.add_argument(
+        "--use_learned_imu_cross_modal_calibration",
+        action="store_true",
+        help=(
+            "apply checkpoint-learned global [R,v,p] visual/IMU information "
+            "calibration together with bounded temporal learned precision"
         ),
     )
     parser.add_argument(
@@ -1979,6 +2105,44 @@ if __name__ == '__main__':
             "fuse each edge's causal IMU innovation, raw IMU quality, frozen "
             "ConvGRU visual evidence, and DROID correspondence-correction "
             "statistics; requires --use_imu_precision_innovation"
+        ),
+    )
+    parser.add_argument(
+        "--use_imu_rotation_flow_adapter",
+        action="store_true",
+        help=(
+            "apply the learned zero-initialized correspondence adapter driven "
+            "by projected IMU-rotation flow innovation; requires learned "
+            "direct R/v/p precision and full IMU BA"
+        ),
+    )
+    parser.add_argument(
+        "--imu_rotation_flow_adapter_full_stage_only",
+        action="store_true",
+        help=(
+            "apply the IMU rotation-flow correspondence adapter only during "
+            "full 15DoF DBA; visual-only preconditioning remains pure DROID"
+        ),
+    )
+    parser.add_argument(
+        "--use_joint_visual_imu_confidence",
+        action="store_true",
+        help=(
+            "use a causal two-way visual/IMU factor allocator together with "
+            "learned R/v/p IMU precision; per-edge gains are softmax-"
+            "normalized and require --use_learned_imu_precision"
+        ),
+    )
+    parser.add_argument(
+        "--joint_visual_imu_reciprocal", action="store_true",
+        help="use checkpointed reciprocal visual/IMU allocation on valid temporal factors",
+    )
+    parser.add_argument(
+        "--joint_visual_imu_full_stage_only",
+        action="store_true",
+        help=(
+            "apply the joint visual--IMU allocator only in full 15DoF BA; "
+            "keep visual-only preconditioning pure DROID"
         ),
     )
     parser.add_argument(
@@ -2267,6 +2431,23 @@ if __name__ == '__main__':
             "--use_vi_initialization requires --use_pose_velocity_imu_ba "
             "or --use_two_stage_imu_ba"
         )
+    if args.motion_filter_max_imu_gap_sec < 0.0:
+        raise ValueError("--motion_filter_max_imu_gap_sec must be >= 0")
+    if args.motion_filter_max_imu_gap_sec > 0.0:
+        if args.imu_prior is None and not args.build_imu_prior:
+            raise ValueError(
+                "--motion_filter_max_imu_gap_sec requires --imu_prior so "
+                "MotionFilter can compose the interval from the last selected frame"
+            )
+        if (
+            args.use_full_imu_ba
+            and args.imu_full_max_dt > 0.0
+            and args.motion_filter_max_imu_gap_sec > args.imu_full_max_dt + 1e-9
+        ):
+            raise ValueError(
+                "--motion_filter_max_imu_gap_sec must not exceed "
+                "--imu_full_max_dt when full 15DoF BA is active"
+            )
     if args.visual_bootstrap_control:
         incompatible = []
         for option, active in (
@@ -2552,7 +2733,46 @@ if __name__ == '__main__':
             '--use_imu_precision_edge_fusion requires '
             '--use_imu_precision_innovation'
         )
-
+    if (
+        args.use_imu_rotation_flow_adapter
+        and not args.use_learned_imu_precision
+    ):
+        raise ValueError(
+            '--use_imu_rotation_flow_adapter requires '
+            '--use_learned_imu_precision'
+        )
+    if args.use_imu_rotation_flow_adapter and not args.use_full_imu_ba:
+        raise ValueError(
+            '--use_imu_rotation_flow_adapter requires --use_full_imu_ba'
+        )
+    if (
+        args.imu_rotation_flow_adapter_full_stage_only
+        and not args.use_imu_rotation_flow_adapter
+    ):
+        raise ValueError(
+            '--imu_rotation_flow_adapter_full_stage_only requires '
+            '--use_imu_rotation_flow_adapter'
+        )
+    if (
+        args.use_joint_visual_imu_confidence
+        and not args.use_learned_imu_precision
+    ):
+        raise ValueError(
+            '--use_joint_visual_imu_confidence requires '
+            '--use_learned_imu_precision'
+        )
+    if (
+        args.joint_visual_imu_full_stage_only
+        and not args.use_joint_visual_imu_confidence
+    ):
+        raise ValueError(
+            '--joint_visual_imu_full_stage_only requires '
+            '--use_joint_visual_imu_confidence'
+        )
+    if args.joint_visual_imu_reciprocal and not (
+        args.use_joint_visual_imu_confidence and args.joint_visual_imu_full_stage_only
+    ):
+        raise ValueError('--joint_visual_imu_reciprocal requires joint confidence and full-stage-only')
     if args.use_component_imu_confidence and not args.use_learned_imu_confidence:
         raise ValueError('--use_component_imu_confidence requires --use_learned_imu_confidence')
     if args.use_component_imu_confidence and not args.use_full_imu_ba:

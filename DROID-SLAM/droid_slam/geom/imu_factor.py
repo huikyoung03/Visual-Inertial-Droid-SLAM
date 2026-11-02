@@ -26,6 +26,34 @@ IMU_CONFIDENCE_COMPONENTS = ("rotation", "velocity", "position")
 IMU_QUALITY_FEATURE_DIM = 7
 
 
+def joint_temporal_edge_support(imu_delta, imu_valid, ii, jj, max_dt=0.5):
+    """Mask visual edges that have a valid direct temporal IMU counterpart.
+
+    This is factor availability, not a learned confidence threshold. Reverse
+    visual edges refer to the same IMU row as forward edges. Long-range visual
+    edges have no corresponding preintegration factor in the current graph.
+    Shared by training and both runtime graph-update paths.
+    """
+    delta = imu_delta.unsqueeze(0) if imu_delta.ndim == 2 else imu_delta
+    valid = imu_valid.unsqueeze(0) if imu_valid.ndim == 1 else imu_valid
+    if delta.ndim != 3 or valid.shape != delta.shape[:2]:
+        raise ValueError("expected IMU delta [B,N,D] and validity [B,N]")
+    ii, jj = ii.to(delta.device).long(), jj.to(delta.device).long()
+    dst = torch.maximum(ii, jj)
+    if ii.shape != jj.shape or bool(((dst >= delta.shape[1]) | (ii < 0) | (jj < 0)).any()):
+        raise ValueError("joint gate edges exceed IMU row coverage")
+    dt = delta[:, dst, 0]
+    support = (
+        ((ii - jj).abs() == 1)[None]
+        & valid.to(device=delta.device, dtype=torch.bool)[:, dst]
+        & torch.isfinite(delta[:, dst]).all(dim=-1)
+        & (dt > 1e-6)
+    )
+    if max_dt > 0:
+        support = support & (dt <= max_dt)
+    return support
+
+
 def bias_random_walk_relative_sqrt_information(
     bias_random_walk: torch.Tensor,
     dt: torch.Tensor,
@@ -568,13 +596,18 @@ def temporal_imu_precision_from_edges(
     num_frames: int,
     fallback: Union[float, torch.Tensor] = 1.0,
     return_coverage: bool = False,
+    allow_factor_amplification: bool = False,
 ):
     """Convert R/v/p edge reliabilities into temporal factor weights.
 
     The public function name is retained for compatibility with the original
-    direct-precision experiment. ``1`` retains the full IMU factor defined by
-    propagated sensor covariance; values below one attenuate it. Clamp here
-    as a BA-side invariant so stale edge caches cannot over-trust an interval.
+    direct-precision experiment. Normally ``1`` retains the full IMU factor
+    defined by propagated sensor covariance and values above one are clamped
+    so stale edge caches cannot over-trust an interval. The learned *joint
+    factor allocator* is the explicit exception: it preserves a per-edge
+    visual/IMU evidence budget and may reallocate visual information to the
+    IMU factor. That opt-in path retains positive gains above one while the
+    base R/v/p reliability remains frozen and covariance-normalized.
     """
 
     temporal = _temporal_imu_values_from_edges(
@@ -584,7 +617,11 @@ def temporal_imu_precision_from_edges(
         num_frames=num_frames,
         fallback=fallback,
         return_coverage=return_coverage,
-        clamp_values=(1e-12, 1.0),
+        clamp_values=(
+            (1e-12, float("inf"))
+            if allow_factor_amplification
+            else (1e-12, 1.0)
+        ),
     )
     values = temporal[0] if return_coverage else temporal
     if values is not None and (
@@ -992,6 +1029,204 @@ def _expand_global_vector(
     raise ValueError(
         f"{name} must be [3], [B, 3], [N, 3], or [B, N, 3], got {tuple(value.shape)}"
     )
+
+
+def edge_imu_rotation_flow_innovation(
+    pose_data: torch.Tensor,
+    imu_delta: Optional[torch.Tensor],
+    intrinsics: torch.Tensor,
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    height: int,
+    width: int,
+    imu_valid: Optional[torch.Tensor] = None,
+    imu_bias_jacobian: Optional[torch.Tensor] = None,
+    gyro_bias: Optional[torch.Tensor] = None,
+    local_gyro_bias: Optional[torch.Tensor] = None,
+    compose_order: str = "dq_prev",
+    inverse_imu: bool = True,
+    eps: float = 1e-9,
+) -> Optional[torch.Tensor]:
+    """Return IMU-minus-visual pure-rotation flow for direct forward edges.
+
+    The tensor is expressed in DROID's 1/8-resolution pixel coordinates and
+    has shape ``[B, E, H, W, 2]``.  It is zero for reverse, non-adjacent, or
+    invalid IMU edges.  This is deliberately an *innovation*, not an IMU
+    optical-flow prior: a zero-initialised learned adapter can therefore
+    preserve an existing visual checkpoint exactly while learning when the
+    physically projected IMU rotation should correct correspondence targets.
+
+    ``dq_prev + inverse_imu`` is the active full-15DoF convention.  Rather
+    than hard-coding its transpose, the implementation derives the IMU target
+    orientation through :func:`predict_imu_rotation`, then forms the same
+    source-camera-to-target-camera relative rotation as DROID projection.
+    """
+
+    if imu_delta is None:
+        return None
+    if height <= 0 or width <= 0:
+        raise ValueError(f"flow resolution must be positive, got {(height, width)}")
+
+    poses = torch.as_tensor(pose_data)
+    if poses.ndim == 2:
+        poses = poses.unsqueeze(0)
+    if poses.ndim != 3 or poses.shape[-1] < 7:
+        raise ValueError(
+            "pose_data must be [B, N, >=7] or [N, >=7] for rotation flow, got "
+            f"{tuple(poses.shape)}"
+        )
+    batch, num_frames = poses.shape[:2]
+    device, dtype = poses.device, poses.dtype
+
+    imu = torch.as_tensor(imu_delta, device=device, dtype=dtype)
+    if imu.ndim == 2:
+        imu = imu.unsqueeze(0)
+    if imu.ndim != 3 or imu.shape[-1] < 4:
+        raise ValueError(
+            "imu_delta must be [B, N, >=4] or [N, >=4] for rotation flow, got "
+            f"{tuple(imu.shape)}"
+        )
+    if imu.shape[0] == 1 and batch > 1:
+        imu = imu.expand(batch, -1, -1)
+    if imu.shape[0] != batch or imu.shape[1] < num_frames:
+        raise ValueError(
+            "imu_delta must cover pose frames for rotation flow, got "
+            f"{tuple(imu.shape)} for B={batch}, N={num_frames}"
+        )
+
+    intr = torch.as_tensor(intrinsics, device=device, dtype=dtype)
+    if intr.ndim == 2:
+        intr = intr.unsqueeze(0)
+    if intr.ndim != 3 or intr.shape[-1] != 4:
+        raise ValueError(
+            "intrinsics must be [B, N, 4] or [N, 4] for rotation flow, got "
+            f"{tuple(intr.shape)}"
+        )
+    if intr.shape[0] == 1 and batch > 1:
+        intr = intr.expand(batch, -1, -1)
+    if intr.shape[0] != batch or intr.shape[1] < num_frames:
+        raise ValueError(
+            "intrinsics must cover pose frames for rotation flow, got "
+            f"{tuple(intr.shape)} for B={batch}, N={num_frames}"
+        )
+
+    ii = ii.to(device=device, dtype=torch.long).reshape(-1)
+    jj = jj.to(device=device, dtype=torch.long).reshape(-1)
+    if ii.numel() != jj.numel():
+        raise ValueError("ii and jj must have matching edge counts")
+    edges = ii.numel()
+    output = poses.new_zeros((batch, edges, height, width, 2))
+    if edges == 0:
+        return output
+
+    # The preintegrated row ending at j corresponds to i=j-1 -> j.  Starting
+    # with forward adjacent edges avoids accidentally applying a one-sided
+    # delta to reverse/proximity factors.
+    direct = (jj == ii + 1) & (ii >= 0) & (jj < num_frames)
+    if not bool(direct.any().item()):
+        return output
+    edge_indices = torch.nonzero(direct, as_tuple=False).reshape(-1)
+    src = ii[edge_indices]
+    dst = jj[edge_indices]
+
+    if imu_valid is not None:
+        valid = torch.as_tensor(imu_valid, device=device, dtype=torch.bool)
+        if valid.ndim == 1:
+            valid = valid.unsqueeze(0)
+        if valid.shape[0] == 1 and batch > 1:
+            valid = valid.expand(batch, -1)
+        if valid.shape[0] != batch or valid.shape[1] < num_frames:
+            raise ValueError(
+                "imu_valid must cover pose frames for rotation flow, got "
+                f"{tuple(valid.shape)} for B={batch}, N={num_frames}"
+            )
+        direct_valid = valid[:, dst]
+    else:
+        direct_valid = imu[:, dst, 0] > float(eps)
+
+    dt = imu[:, dst, 0:1].clamp_min(0.0)
+    bias_jacobian = select_imu_bias_jacobian(
+        imu_bias_jacobian,
+        dst,
+        batch,
+        num_frames,
+        device,
+        dtype,
+        dt,
+    )
+    global_gyro = _expand_global_vector(
+        gyro_bias,
+        src,
+        batch,
+        num_frames,
+        device,
+        dtype,
+        "gyro_bias",
+    )
+    if local_gyro_bias is None:
+        local_gyro = torch.zeros_like(global_gyro)
+    else:
+        local = torch.as_tensor(local_gyro_bias, device=device, dtype=dtype)
+        if local.ndim == 2:
+            local = local.unsqueeze(0)
+        if local.ndim != 3 or local.shape[-1] != 3:
+            raise ValueError(
+                "local_gyro_bias must be [B, N, 3] or [N, 3], got "
+                f"{tuple(local.shape)}"
+            )
+        if local.shape[0] == 1 and batch > 1:
+            local = local.expand(batch, -1, -1)
+        if local.shape[0] != batch or local.shape[1] < num_frames:
+            raise ValueError(
+                "local_gyro_bias must cover pose frames, got "
+                f"{tuple(local.shape)} for B={batch}, N={num_frames}"
+            )
+        local_gyro = local[:, src]
+
+    rotvec = imu[:, dst, 1:4] + torch.matmul(
+        bias_jacobian[:, :, 0], (global_gyro + local_gyro).unsqueeze(-1)
+    ).squeeze(-1)
+    q_i = poses[:, src, 3:7]
+    q_j = poses[:, dst, 3:7]
+    q_pred_j = predict_imu_rotation(
+        q_i,
+        rotvec_to_quat(rotvec),
+        compose_order=compose_order,
+        inverse_imu=inverse_imu,
+    )
+    R_visual_i_to_j = quat_to_rotmat(quat_multiply(q_j, quat_inverse(q_i)))
+    R_imu_i_to_j = quat_to_rotmat(
+        quat_multiply(q_pred_j, quat_inverse(q_i))
+    )
+
+    fx, fy, cx, cy = intr[:, src].unbind(dim=-1)
+    y, x = torch.meshgrid(
+        torch.arange(height, device=device, dtype=dtype),
+        torch.arange(width, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    x = x.view(1, 1, height, width)
+    y = y.view(1, 1, height, width)
+    fx = fx[..., None, None]
+    fy = fy[..., None, None]
+    cx = cx[..., None, None]
+    cy = cy[..., None, None]
+    rays = torch.stack(
+        ((x - cx) / fx.clamp_min(float(eps)), (y - cy) / fy.clamp_min(float(eps)), torch.ones_like(x + fx)),
+        dim=-1,
+    )
+
+    def project(rotation: torch.Tensor) -> torch.Tensor:
+        target_rays = torch.einsum("beij,behwj->behwi", rotation, rays)
+        z = target_rays[..., 2].clamp_min(float(eps))
+        u = fx * target_rays[..., 0] / z + cx
+        v = fy * target_rays[..., 1] / z + cy
+        return torch.stack((u - x, v - y), dim=-1)
+
+    innovation = project(R_imu_i_to_j) - project(R_visual_i_to_j)
+    innovation = innovation * direct_valid[..., None, None, None].to(dtype)
+    output[:, edge_indices] = innovation
+    return output
 
 
 def _as_batched_motion(

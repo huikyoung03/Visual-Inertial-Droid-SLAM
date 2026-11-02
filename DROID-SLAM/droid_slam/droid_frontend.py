@@ -41,6 +41,14 @@ class DroidFrontend:
             apply_imu_residual=getattr(args, "use_imu_residual", False),
             use_learned_imu_confidence=getattr(args, "use_learned_imu_confidence", False),
             use_learned_imu_precision=getattr(args, "use_learned_imu_precision", False),
+            use_learned_imu_cross_modal_calibration=getattr(
+                args, "use_learned_imu_cross_modal_calibration", False
+            ),
+            imu_cross_modal_calibration=(
+                net.get_imu_cross_modal_calibration()
+                if getattr(args, "use_learned_imu_cross_modal_calibration", False)
+                else None
+            ),
             use_imu_precision_discrepancy=getattr(
                 args, "use_imu_precision_discrepancy", False
             ),
@@ -52,6 +60,18 @@ class DroidFrontend:
             ),
             use_imu_precision_edge_fusion=getattr(
                 args, "use_imu_precision_edge_fusion", False
+            ),
+            use_joint_visual_imu_confidence=getattr(
+                args, "use_joint_visual_imu_confidence", False
+            ),
+            joint_visual_imu_full_stage_only=getattr(
+                args, "joint_visual_imu_full_stage_only", False
+            ),
+            use_imu_rotation_flow_adapter=getattr(
+                args, "use_imu_rotation_flow_adapter", False
+            ),
+            imu_rotation_flow_adapter_full_stage_only=getattr(
+                args, "imu_rotation_flow_adapter_full_stage_only", False
             ),
             use_component_imu_confidence=getattr(args, "use_component_imu_confidence", False),
             use_dvi_imu_confidence=getattr(args, "use_dvi_imu_confidence", False),
@@ -127,10 +147,18 @@ class DroidFrontend:
             imu_ba_outer_relinearize=getattr(args, "imu_ba_outer_relinearize", False),
             imu_ba_outer_relinearize_interval=getattr(args, "imu_ba_outer_relinearize_interval", 10),
             imu_ba_outer_window=getattr(args, "imu_ba_outer_window", 0),
+            imu_full_ba_outer_relinearize=getattr(
+                args, "imu_full_ba_outer_relinearize", False
+            ),
             imu_ba_debug=getattr(args, "imu_ba_debug", False),
             imu_ba_debug_path=getattr(args, "imu_ba_debug_path", None),
             imu_ba_debug_max_rows=getattr(args, "imu_ba_debug_max_rows", 20000),
             imu_ba_debug_stage="frontend",
+            imu_state_update_audit_path=getattr(
+                args, "imu_state_update_audit_path", None
+            ),
+            imu_influence_audit_path=getattr(args, "imu_influence_audit_path", None),
+            imu_influence_audit_min_window=getattr(args, "imu_influence_audit_min_window", 128),
         )
 
         # local optimization window
@@ -176,6 +204,15 @@ class DroidFrontend:
         self.frontend_window = args.frontend_window
         self.frontend_thresh = args.frontend_thresh
         self.frontend_radius = args.frontend_radius
+        # Keep the optional MotionFilter IMU-gap bridge intact when the
+        # frontend applies its visual redundancy rule. Without this guard a
+        # forced temporal keyframe could immediately be marginalized and its
+        # two short preintegrations recomposed into the same overlong factor.
+        self.imu_keyframe_max_gap_sec = max(
+            0.0, float(getattr(args, "motion_filter_max_imu_gap_sec", 0.0))
+        )
+        self._imu_gap_removal_prevented = 0
+        self.video.frontend_imu_gap_removal_prevented = 0
 
         self.depth_window = 3
 
@@ -248,6 +285,31 @@ class DroidFrontend:
             self.graph.set_imu_ba_stage(stage)
         for _ in range(iterations):
             self.graph.update(None, None, use_inactive=True)
+
+    def _would_break_imu_gap_if_removed(self, ix):
+        """Whether removing keyframe ``ix`` would compose an overlong IMU edge."""
+
+        if self.imu_keyframe_max_gap_sec <= 0.0:
+            return False
+        count = int(self.video.counter.value)
+        ix = int(ix)
+        if ix <= 0 or ix + 1 >= count:
+            return False
+        try:
+            valid = bool(self.video.imu_valid[ix].item()) and bool(
+                self.video.imu_valid[ix + 1].item()
+            )
+            if not valid:
+                return False
+            dt = float(
+                (self.video.imu_delta[ix, 0] + self.video.imu_delta[ix + 1, 0])
+                .detach()
+                .cpu()
+                .item()
+            )
+        except (AttributeError, IndexError, RuntimeError):
+            return False
+        return np.isfinite(dt) and dt > self.imu_keyframe_max_gap_sec + 1e-9
 
     def _has_vi_alignment(self):
         ready = getattr(self.video, "imu_alignment_ready", None)
@@ -721,6 +783,26 @@ class DroidFrontend:
                 [self.t1 - 4], [self.t1 - 2], beta=self.beta, bidirectional=True
             )
             removed_keyframe = d.item() < 2 * self.keyframe_thresh
+            candidate_ix = self.t1 - 3
+            if (
+                removed_keyframe
+                and self._would_break_imu_gap_if_removed(candidate_ix)
+            ):
+                removed_keyframe = False
+                self._imu_gap_removal_prevented += 1
+                self.video.frontend_imu_gap_removal_prevented = (
+                    self._imu_gap_removal_prevented
+                )
+                if (
+                    self._imu_gap_removal_prevented <= 5
+                    or self._imu_gap_removal_prevented % 25 == 0
+                ):
+                    print(
+                        "[IMU-MAX-GAP] retaining visual-redundant keyframe "
+                        f"ix={candidate_ix} to preserve <="
+                        f"{self.imu_keyframe_max_gap_sec:.6g}s IMU factors; "
+                        f"count={self._imu_gap_removal_prevented}"
+                    )
         if removed_keyframe:
             self.graph.rm_keyframe(self.t1 - 3)
 

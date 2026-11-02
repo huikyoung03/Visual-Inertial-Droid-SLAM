@@ -139,11 +139,15 @@ def freeze_non_imu_parameters(
     use_dvi_imu_confidence=False,
     use_dvi_imu_quality_fusion=False,
     use_learned_imu_precision=False,
+    use_learned_imu_cross_modal_calibration=False,
     use_imu_precision_discrepancy=False,
     use_imu_precision_innovation=False,
     use_imu_precision_visual_innovation=False,
     use_imu_precision_edge_fusion=False,
+    use_joint_visual_imu_confidence=False,
+    use_imu_rotation_flow_adapter=False,
     freeze_existing_imu_precision=False,
+    freeze_imu_cross_modal_calibration=False,
     freeze_imu_ba_weight=False,
     freeze_imu_confidence_head=False,
     imu_confidence_only_weighting=False,
@@ -222,6 +226,12 @@ def freeze_non_imu_parameters(
                 if use_imu_precision_edge_fusion:
                     for p in model.update.imu_precision_edge_fusion.parameters():
                         p.requires_grad_(True)
+                if use_joint_visual_imu_confidence:
+                    for p in model.update.imu_visual_joint_gate.parameters():
+                        p.requires_grad_(True)
+                if use_imu_rotation_flow_adapter:
+                    for p in model.update.imu_rotation_flow_adapter.parameters():
+                        p.requires_grad_(True)
             elif use_component_imu_confidence:
                 for p in model.update.imu_component_confidence.parameters():
                     p.requires_grad_(True)
@@ -236,6 +246,12 @@ def freeze_non_imu_parameters(
             else:
                 for p in model.update.imu_confidence.parameters():
                     p.requires_grad_(True)
+
+        if (
+            use_learned_imu_cross_modal_calibration
+            and not freeze_imu_cross_modal_calibration
+        ):
+            model.imu_cross_modal_log_precision.requires_grad_(True)
 
     if use_learned_imu_residual_weights:
         model.imu_pos_log_weight.requires_grad_(True)
@@ -941,6 +957,167 @@ def imu_precision_augmentation_calibration_loss(
     }
 
 
+def augment_joint_visual_inputs(
+    images,
+    *,
+    probability=1.0,
+    noise_std=12.0,
+    brightness_min=0.50,
+    occlusion_fraction=0.25,
+):
+    """Create a paired, train-only visual-tracking failure example.
+
+    The IMU stream is deliberately left unchanged.  Each selected clip has
+    reduced illumination, mild defocus/noise, and one independently placed
+    occluder per image.  These are not runtime rules and do not supply a
+    numerical confidence target: they only let the visual gate observe a
+    case where preserving the clean visual correspondence weights is no
+    longer optimal.
+    """
+
+    if images.ndim != 5:
+        raise ValueError(
+            "joint visual corruption expects images [B, N, C, H, W], got "
+            f"{tuple(images.shape)}"
+        )
+    probability = float(probability)
+    if probability <= 0.0:
+        return images, torch.zeros(images.shape[0], device=images.device, dtype=torch.bool)
+    if not (0.0 < float(brightness_min) <= 1.0):
+        raise ValueError("joint visual brightness_min must be in (0, 1]")
+    if not (0.0 < float(occlusion_fraction) < 1.0):
+        raise ValueError("joint visual occlusion_fraction must be in (0, 1)")
+
+    batch, frames, channels, height, width = images.shape
+    selected = torch.rand(batch, device=images.device) < min(probability, 1.0)
+    if not bool(selected.any().detach().cpu().item()):
+        return images, selected
+
+    # Defocus is applied before noise.  It models a degraded optical track
+    # without changing image geometry or the camera/IMU time association.
+    blurred = F.avg_pool2d(
+        images.reshape(batch * frames, channels, height, width),
+        kernel_size=5,
+        stride=1,
+        padding=2,
+    ).reshape_as(images)
+    brightness = torch.empty(
+        (batch, 1, 1, 1, 1), device=images.device, dtype=images.dtype
+    ).uniform_(float(brightness_min), 0.80)
+    noisy = blurred * brightness
+    if float(noise_std) > 0.0:
+        noisy = noisy + torch.randn_like(noisy) * float(noise_std)
+    corrupted = noisy.clamp_(0.0, 255.0)
+
+    # A moving local occluder is considerably more informative for a
+    # correspondence gate than a global brightness change alone.
+    crop_h = max(1, int(round(height * float(occlusion_fraction))))
+    crop_w = max(1, int(round(width * float(occlusion_fraction))))
+    for batch_index in range(batch):
+        if not bool(selected[batch_index].detach().cpu().item()):
+            continue
+        for frame_index in range(frames):
+            top = int(torch.randint(0, height - crop_h + 1, (), device=images.device))
+            left = int(torch.randint(0, width - crop_w + 1, (), device=images.device))
+            corrupted[
+                batch_index,
+                frame_index,
+                :,
+                top:top + crop_h,
+                left:left + crop_w,
+            ] = 0.0
+
+    selected = selected.view(batch, 1, 1, 1, 1)
+    return torch.where(selected, corrupted, images), selected.view(batch)
+
+
+def joint_visual_imu_allocation_pair_metrics(clean_gates, corrupted_gates, reciprocal=False):
+    """Audit paired factor allocation without imposing a gate target.
+
+    Each entry is ``[B, E, 2]`` in visual/IMU order. Legacy softmax gains have
+    sum two; reciprocal gains have product one. These are multiplier
+    constraints, not conservation of physical Hessian information.
+    The GT post-BA pose losses of the clean and corrupted passes are the
+    training objectives; this routine deliberately contributes *no* rank or
+    identity loss.  The former absolute visual gate used those auxiliary
+    losses and learned the degenerate solution of suppressing visual factors
+    globally.
+    """
+
+    metrics = {
+        "joint_visual_gate_pair_rank": 0.0,
+        "joint_visual_gate_clean_identity": 0.0,
+        "joint_visual_gate_clean_mean_pair": 0.0,
+        "joint_visual_gate_corrupt_mean_pair": 0.0,
+        "joint_imu_gate_clean_mean_pair": 0.0,
+        "joint_imu_gate_corrupt_mean_pair": 0.0,
+        "joint_factor_allocation_sum_error": 0.0,
+        "joint_factor_allocation_pair_l1_shift": 0.0,
+        "joint_visual_gate_pair_values": 0.0,
+    }
+    if not clean_gates or not corrupted_gates:
+        reference = (
+            clean_gates[-1] if clean_gates else corrupted_gates[-1]
+            if corrupted_gates else None
+        )
+        if reference is None:
+            raise ValueError("joint factor allocation received no gate tensors")
+        return reference.sum() * 0.0, reference.sum() * 0.0, metrics
+    if len(clean_gates) != len(corrupted_gates):
+        raise ValueError(
+            "clean/corrupted visual-gate unroll counts differ: "
+            f"{len(clean_gates)} vs {len(corrupted_gates)}"
+        )
+
+    for clean_gate, corrupted_gate in zip(clean_gates, corrupted_gates):
+        if clean_gate is None or corrupted_gate is None:
+            raise ValueError("paired factor-allocation output is missing")
+        if clean_gate.shape != corrupted_gate.shape:
+            raise ValueError(
+                "paired factor-allocation shapes differ: "
+                f"{tuple(clean_gate.shape)} vs {tuple(corrupted_gate.shape)}"
+            )
+        if clean_gate.ndim != 3 or clean_gate.shape[-1] != 2:
+            raise ValueError(
+                "factor allocation must be [B, E, 2] in visual/IMU order, got "
+                f"{tuple(clean_gate.shape)}"
+            )
+    clean = torch.cat([value.reshape(-1, 2) for value in clean_gates], dim=0)
+    corrupted = torch.cat(
+        [value.reshape(-1, 2) for value in corrupted_gates], dim=0
+    )
+    if not torch.isfinite(clean).all() or not torch.isfinite(corrupted).all():
+        raise ValueError("joint factor allocation must be finite")
+    clean_budget_error = (
+        (clean.prod(dim=-1) - 1.0) if reciprocal else (clean.sum(dim=-1) - 2.0)
+    ).abs().max()
+    corrupt_budget_error = (
+        (corrupted.prod(dim=-1) - 1.0) if reciprocal else (corrupted.sum(dim=-1) - 2.0)
+    ).abs().max()
+    budget_error = torch.maximum(clean_budget_error, corrupt_budget_error)
+    if float(budget_error.detach().cpu()) > 1e-5:
+        raise RuntimeError(
+            "joint factor allocation violated its multiplier invariant: "
+            f"max error={float(budget_error.detach().cpu())}"
+        )
+    # Keep the historical two return slots zero for logging/checkpoint
+    # compatibility. They are intentionally excluded from the loss below.
+    rank_loss = clean.sum() * 0.0
+    identity_loss = clean.sum() * 0.0
+    metrics.update({
+        "joint_visual_gate_clean_mean_pair": clean[:, 0].detach().mean().item(),
+        "joint_visual_gate_corrupt_mean_pair": corrupted[:, 0].detach().mean().item(),
+        "joint_imu_gate_clean_mean_pair": clean[:, 1].detach().mean().item(),
+        "joint_imu_gate_corrupt_mean_pair": corrupted[:, 1].detach().mean().item(),
+        "joint_factor_allocation_sum_error": budget_error.detach().item(),
+        "joint_factor_allocation_pair_l1_shift": (
+            (clean - corrupted).abs().mean().detach().item()
+        ),
+        "joint_visual_gate_pair_values": float(clean.shape[0]),
+    })
+    return rank_loss, identity_loss, metrics
+
+
 def select_full_imu_stage_outputs(
     poses_est,
     imu_confidences,
@@ -1144,6 +1321,12 @@ def train(gpu, args):
         if gpu == 0 and (missing or unexpected):
             print(f"[CKPT] missing={missing}, unexpected={unexpected}")
 
+    if args.use_joint_visual_imu_confidence:
+        model.update.configure_joint_allocation(args.joint_visual_imu_reciprocal, training=True)
+        if gpu == 0:
+            print(f"[JOINT] equation_version={int(model.update.joint_allocation_version)} "
+                  f"runtime_precision_recompute={args.joint_visual_imu_reciprocal}")
+
     if args.use_component_imu_confidence and not checkpoint_has_component_imu_confidence:
         model.initialize_component_imu_confidence_from_scalar()
         if gpu == 0:
@@ -1333,6 +1516,7 @@ def train(gpu, args):
     #   - update network 안의 IMU confidence branch freeze
     if not args.use_imu_ba:
         model.imu_ba_log_weight.requires_grad_(False)
+        model.imu_cross_modal_log_precision.requires_grad_(False)
         model.imu_pos_log_weight.requires_grad_(False)
         model.imu_vel_log_weight.requires_grad_(False)
 
@@ -1357,6 +1541,8 @@ def train(gpu, args):
         for p in model.update.imu_precision_visual_innovation.parameters():
             p.requires_grad_(False)
         for p in model.update.imu_precision_edge_fusion.parameters():
+            p.requires_grad_(False)
+        for p in model.update.imu_visual_joint_gate.parameters():
             p.requires_grad_(False)
 
     if (
@@ -1403,6 +1589,14 @@ def train(gpu, args):
         if not args.use_imu_precision_edge_fusion:
             for p in model.update.imu_precision_edge_fusion.parameters():
                 p.requires_grad_(False)
+        if not args.use_joint_visual_imu_confidence:
+            for p in model.update.imu_visual_joint_gate.parameters():
+                p.requires_grad_(False)
+        if not args.use_imu_rotation_flow_adapter:
+            for p in model.update.imu_rotation_flow_adapter.parameters():
+                p.requires_grad_(False)
+        if not args.use_learned_imu_cross_modal_calibration:
+            model.imu_cross_modal_log_precision.requires_grad_(False)
     elif args.use_component_imu_confidence:
         for p in model.update.imu_confidence.parameters():
             p.requires_grad_(False)
@@ -1459,13 +1653,25 @@ def train(gpu, args):
             use_dvi_imu_confidence=args.use_dvi_imu_confidence,
             use_dvi_imu_quality_fusion=args.use_dvi_imu_quality_fusion,
             use_learned_imu_precision=args.use_learned_imu_precision,
+            use_learned_imu_cross_modal_calibration=(
+                args.use_learned_imu_cross_modal_calibration
+            ),
             use_imu_precision_discrepancy=args.use_imu_precision_discrepancy,
             use_imu_precision_innovation=args.use_imu_precision_innovation,
             use_imu_precision_visual_innovation=(
                 args.use_imu_precision_visual_innovation
             ),
             use_imu_precision_edge_fusion=args.use_imu_precision_edge_fusion,
+            use_joint_visual_imu_confidence=(
+                args.use_joint_visual_imu_confidence
+            ),
+            use_imu_rotation_flow_adapter=(
+                args.use_imu_rotation_flow_adapter
+            ),
             freeze_existing_imu_precision=args.freeze_existing_imu_precision,
+            freeze_imu_cross_modal_calibration=(
+                args.freeze_imu_cross_modal_calibration
+            ),
             freeze_imu_ba_weight=args.freeze_imu_ba_weight,
             freeze_imu_confidence_head=args.freeze_imu_confidence_head,
             imu_confidence_only_weighting=args.imu_confidence_only_weighting,
@@ -1711,6 +1917,20 @@ def train(gpu, args):
             # covariance remains meaningful in the training BA/loss.
             imu_info_reference = item[8] if len(item) > 8 else None
 
+            # Opt-in runtime-matched IMU factor availability. Keep the
+            # historical training mask unchanged when this option is absent.
+            if args.imu_train_max_dt is not None and imu_delta is not None:
+                if imu_valid is None:
+                    raise ValueError('--imu_train_max_dt requires imu_valid rows')
+                dt = imu_delta[..., 0]
+                imu_valid = (
+                    imu_valid.bool()
+                    & torch.isfinite(imu_delta).all(dim=-1)
+                    & (dt > 1e-6)
+                )
+                if args.imu_train_max_dt > 0.0:
+                    imu_valid = imu_valid & (dt <= args.imu_train_max_dt)
+
             # Confidence training sees train-only IMU degradation *before*
             # both its direct raw-quality features and the full-IMU DBA.  The
             # visual-only prefix below deliberately receives no IMU factor,
@@ -1811,11 +2031,20 @@ def train(gpu, args):
                 # 14-6-1. DroidNet forward
                 ################################################
 
+                paired_initial_Gs = None
+                paired_initial_disp = None
+                if args.use_joint_visual_gate_pair_training:
+                    paired_initial_Gs = SE3(Gs.data.clone())
+                    paired_initial_disp = disp0.clone()
+
                 with torch.set_grad_enabled(not args.eval_only):
-                    model_output = model(
-                        Gs,
-                        images,
-                        disp0,
+                    # Both branches below must share every state, IMU row,
+                    # graph edge and solver setting.  Only the image tensor
+                    # differs in paired visual-gate training.
+                    model_forward = lambda state, frame_images, seed_disp, **extra_forward_kwargs: model(
+                        state,
+                        frame_images,
+                        seed_disp,
                         intrinsics0,
                         graph,
                         num_steps=args.iters,
@@ -1855,6 +2084,9 @@ def train(gpu, args):
                         use_dvi_imu_confidence=args.use_dvi_imu_confidence,
                         use_dvi_imu_quality_fusion=args.use_dvi_imu_quality_fusion,
                         use_learned_imu_precision=args.use_learned_imu_precision,
+                        use_learned_imu_cross_modal_calibration=(
+                            args.use_learned_imu_cross_modal_calibration
+                        ),
                         use_imu_precision_discrepancy=(
                             args.use_imu_precision_discrepancy
                         ),
@@ -1865,11 +2097,27 @@ def train(gpu, args):
                         use_imu_precision_edge_fusion=(
                             args.use_imu_precision_edge_fusion
                         ),
+                        use_joint_visual_imu_confidence=(
+                            args.use_joint_visual_imu_confidence
+                        ),
+                        joint_visual_imu_full_stage_only=(
+                            args.joint_visual_imu_full_stage_only
+                        ),
+                        return_joint_visual_gate=(
+                            args.use_joint_visual_gate_pair_training
+                        ),
+                        use_imu_rotation_flow_adapter=(
+                            args.use_imu_rotation_flow_adapter
+                        ),
+                        imu_rotation_flow_adapter_full_stage_only=(
+                            args.imu_rotation_flow_adapter_full_stage_only
+                        ),
 
                         # full IMU BA 관련 설정
                         use_full_imu_ba=args.use_full_imu_ba,
                         imu_pose_only_steps=imu_train_pose_only_steps,
                         imu_full_stage_schedule=imu_train_full_schedule,
+                        imu_train_max_dt=args.imu_train_max_dt,
                         imu_full_pos_weight=args.imu_full_pos_weight,
                         imu_full_vel_weight=args.imu_full_vel_weight,
                         use_learned_imu_residual_weights=args.use_learned_imu_residual_weights,
@@ -1909,7 +2157,9 @@ def train(gpu, args):
                         imu_gate_residual_vel_soft=args.imu_gate_residual_vel_soft,
                         return_imu_adaptive_gate=args.use_adaptive_imu_gate,
                         return_imu_motion=return_imu_motion,
+                        **extra_forward_kwargs,
                     )
+                    model_output = model_forward(Gs, images, disp0)
 
                 ################################################
                 # 14-6-2. model output unpacking
@@ -1918,6 +2168,8 @@ def train(gpu, args):
                 imu_confidences = []
                 imu_adaptive_gates = []
                 imu_motions = []
+                joint_visual_gates = []
+                joint_imu_edge_precisions = []
 
                 if args.use_imu_ba:
                     poses_est, disps_est, residuals, gyro_bias, imu_confidences = model_output[:5]
@@ -1927,6 +2179,35 @@ def train(gpu, args):
                         output_index += 1
                     if return_imu_motion:
                         imu_motions = model_output[output_index]
+                        output_index += 1
+                    if args.use_joint_visual_gate_pair_training:
+                        joint_visual_gates = model_output[output_index]
+                        output_index += 1
+                        joint_imu_edge_precisions = model_output[output_index]
+                        output_index += 1
+                        expected_precision_steps = int(args.iters)
+                        expected_gate_steps = sum(
+                            1
+                            for is_full in imu_train_full_schedule
+                            if (
+                                not args.joint_visual_imu_full_stage_only
+                                or is_full
+                            )
+                        )
+                        if len(joint_imu_edge_precisions) != expected_precision_steps:
+                            raise RuntimeError(
+                                "paired visual-gate training requires one clean "
+                                "direct-IMU precision override per unroll: "
+                                f"expected {expected_precision_steps}, got "
+                                f"{len(joint_imu_edge_precisions)}"
+                            )
+                        if len(joint_visual_gates) != expected_gate_steps:
+                            raise RuntimeError(
+                                "paired visual-gate training received an invalid "
+                                "number of active gates: "
+                                f"expected {expected_gate_steps}, got "
+                                f"{len(joint_visual_gates)}"
+                            )
 
                 elif use_imu_data:
                     if return_imu_motion:
@@ -2293,6 +2574,90 @@ def train(gpu, args):
                         )
                     )
 
+                # Paired visual supervision is intentionally modality
+                # specific: camera appearance is damaged while the exact
+                # same IMU factors, starting state, graph and BA schedule are
+                # retained.  Therefore the only useful adaptation is the new
+                # correspondence gate; the loaded direct R/v/p IMU precision
+                # remains frozen by validation and freeze_non_imu_parameters.
+                joint_visual_gate_rank_loss = torch.zeros((), device=images.device)
+                joint_visual_gate_identity_loss = torch.zeros((), device=images.device)
+                joint_visual_corrupt_pose_loss = torch.zeros((), device=images.device)
+                joint_visual_gate_pair_metrics = {
+                    "joint_visual_gate_pair_rank": 0.0,
+                    "joint_visual_gate_clean_identity": 0.0,
+                    "joint_visual_gate_clean_mean_pair": 0.0,
+                    "joint_visual_gate_corrupt_mean_pair": 0.0,
+                    "joint_visual_gate_pair_values": 0.0,
+                    "joint_visual_corrupt_pose_loss": 0.0,
+                    "joint_visual_corruption_applied_fraction": 0.0,
+                }
+                if args.use_joint_visual_gate_pair_training:
+                    corrupted_images, corruption_selected = augment_joint_visual_inputs(
+                        images,
+                        probability=args.joint_visual_corruption_probability,
+                        noise_std=args.joint_visual_corruption_noise_std,
+                        brightness_min=args.joint_visual_corruption_brightness_min,
+                        occlusion_fraction=(
+                            args.joint_visual_corruption_occlusion_fraction
+                        ),
+                    )
+                    if not bool(corruption_selected.any().detach().cpu().item()):
+                        raise RuntimeError(
+                            "paired visual-gate training sampled no corrupted "
+                            "clip; use a positive corruption probability"
+                        )
+                    with torch.set_grad_enabled(not args.eval_only):
+                        corrupted_output = model_forward(
+                            paired_initial_Gs,
+                            corrupted_images,
+                            paired_initial_disp,
+                            joint_imu_precision_override=(
+                                None if args.joint_visual_imu_reciprocal
+                                else joint_imu_edge_precisions
+                            ),
+                        )
+                    corrupted_poses = corrupted_output[0]
+                    corrupt_index = 5
+                    if args.use_adaptive_imu_gate:
+                        corrupt_index += 1
+                    if return_imu_motion:
+                        corrupt_index += 1
+                    corrupted_joint_visual_gates = corrupted_output[corrupt_index]
+                    (
+                        joint_visual_gate_rank_loss,
+                        joint_visual_gate_identity_loss,
+                        joint_visual_gate_pair_metrics,
+                    ) = joint_visual_imu_allocation_pair_metrics(
+                        joint_visual_gates,
+                        corrupted_joint_visual_gates,
+                        reciprocal=args.joint_visual_imu_reciprocal,
+                    )
+                    (
+                        joint_visual_corrupt_pose_loss,
+                        corrupt_pose_metrics,
+                    ) = losses.final_ba_pose_loss(
+                        Ps,
+                        corrupted_poses[-1],
+                        graph,
+                        temporal_only=not args.imu_confidence_post_ba_all_edges,
+                        multi_horizon=args.imu_confidence_post_ba_multi_horizon,
+                    )
+                    joint_visual_gate_pair_metrics.update({
+                        "joint_visual_corrupt_pose_loss": (
+                            joint_visual_corrupt_pose_loss.detach().item()
+                        ),
+                        "joint_visual_corruption_applied_fraction": float(
+                            corruption_selected.float().mean().detach().item()
+                        ),
+                        "joint_visual_corrupt_pose_translation": (
+                            corrupt_pose_metrics["post_ba_pose_translation"]
+                        ),
+                        "joint_visual_corrupt_pose_rotation": (
+                            corrupt_pose_metrics["post_ba_pose_rotation"]
+                        ),
+                    })
+
                 # The post-BA pose loss remains the primary task objective.
                 # This auxiliary signal is available only because training
                 # deliberately injects a known IMU degradation; it prevents
@@ -2343,6 +2708,8 @@ def train(gpu, args):
                     + args.w_imu_precision_augmentation_calibration
                     * precision_augmentation_loss
                     + args.w_imu_residual_weight_prior * residual_weight_prior_loss
+                    + args.w_joint_visual_corrupt_pose
+                    * joint_visual_corrupt_pose_loss
                 )
 
                 if not args.eval_only:
@@ -2371,6 +2738,7 @@ def train(gpu, args):
             metrics.update(confidence_pose_prior_metrics)
             metrics.update(post_ba_pose_metrics)
             metrics.update(precision_augmentation_metrics)
+            metrics.update(joint_visual_gate_pair_metrics)
 
             # Log weighted contributions, not just raw component values.  The
             # relative magnitudes determine whether the IMU branch has enough
@@ -2401,6 +2769,15 @@ def train(gpu, args):
             ).detach().item()
             metrics["loss_residual_weight_prior_weighted"] = (
                 args.w_imu_residual_weight_prior * residual_weight_prior_loss
+            ).detach().item()
+            metrics["loss_joint_visual_gate_rank_weighted"] = (
+                args.w_joint_visual_gate_rank * joint_visual_gate_rank_loss
+            ).detach().item()
+            metrics["loss_joint_visual_gate_identity_weighted"] = (
+                args.w_joint_visual_gate_identity * joint_visual_gate_identity_loss
+            ).detach().item()
+            metrics["loss_joint_visual_corrupt_pose_weighted"] = (
+                args.w_joint_visual_corrupt_pose * joint_visual_corrupt_pose_loss
             ).detach().item()
             metrics["loss_total"] = loss.detach().item()
             metrics["imu_pose_only_unroll_steps"] = float(
@@ -2511,6 +2888,32 @@ def train(gpu, args):
                     metrics["imu_precision_rot_mean"] = active_conf[:, 0].mean().item()
                     metrics["imu_precision_vel_mean"] = active_conf[:, 1].mean().item()
                     metrics["imu_precision_pos_mean"] = active_conf[:, 2].mean().item()
+                    if args.use_learned_imu_cross_modal_calibration:
+                        calibration = model.module.get_imu_cross_modal_calibration().detach()
+                        metrics["imu_cross_modal_rot"] = calibration[0].item()
+                        metrics["imu_cross_modal_vel"] = calibration[1].item()
+                        metrics["imu_cross_modal_pos"] = calibration[2].item()
+                if args.use_joint_visual_imu_confidence:
+                    core_model = model.module if hasattr(model, 'module') else model
+                    visual_gate = getattr(
+                        core_model.update, "last_joint_visual_gate", None
+                    )
+                    imu_gate = getattr(
+                        core_model.update, "last_joint_imu_gate", None
+                    )
+                    if visual_gate is not None and visual_gate.numel() > 0:
+                        metrics["joint_visual_gate_mean"] = visual_gate.mean().item()
+                        metrics["joint_visual_gate_min"] = visual_gate.min().item()
+                        metrics["joint_visual_gate_max"] = visual_gate.max().item()
+                    if imu_gate is not None and imu_gate.numel() > 0:
+                        metrics["joint_imu_gate_mean"] = imu_gate.mean().item()
+                        metrics["joint_imu_gate_min"] = imu_gate.min().item()
+                        metrics["joint_imu_gate_max"] = imu_gate.max().item()
+                    if visual_gate is not None and imu_gate is not None:
+                        metrics["joint_factor_budget_max_error"] = (
+                            ((visual_gate * imu_gate - 1.0) if args.joint_visual_imu_reciprocal
+                             else (visual_gate + imu_gate - 2.0)).abs().max().item()
+                        )
                 metrics["imu_conf_saturation_loss"] = confidence_reg_loss.detach().item()
                 metrics["imu_confidence_nll"] = confidence_nll_loss.detach().item()
                 metrics["imu_confidence_schedule_loss"] = (
@@ -2852,6 +3255,16 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
+        '--imu_train_max_dt',
+        type=float,
+        default=None,
+        help=(
+            'optional maximum selected-keyframe IMU interval in seconds for '
+            'training BA, augmentation, and confidence losses; zero accepts '
+            'all positive finite intervals; omitted preserves older runs'
+        ),
+    )
+    parser.add_argument(
         '--use_pose_velocity_imu_ba',
         action='store_true',
         help=(
@@ -2906,6 +3319,15 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
+        '--use_learned_imu_cross_modal_calibration',
+        action='store_true',
+        help=(
+            'learn a global positive [R,v,p] visual/IMU information calibration '
+            'in addition to bounded temporal direct precision; this is not a '
+            'fixed IMU lambda'
+        ),
+    )
+    parser.add_argument(
         '--use_imu_precision_discrepancy',
         action='store_true',
         help=(
@@ -2941,11 +3363,110 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
+        '--use_imu_rotation_flow_adapter',
+        action='store_true',
+        help=(
+            'learn a zero-initialized signed correspondence correction from '
+            'projected IMU-rotation flow minus current visual-pose rotation '
+            'flow; requires learned direct R/v/p precision and full IMU BA'
+        ),
+    )
+    parser.add_argument(
+        '--imu_rotation_flow_adapter_full_stage_only',
+        action='store_true',
+        help=(
+            'apply the IMU rotation-flow correspondence adapter only during '
+            'full 15DoF DBA unrolls; visual-only unrolls remain pure DROID'
+        ),
+    )
+    parser.add_argument(
+        '--use_joint_visual_imu_confidence',
+        action='store_true',
+        help=(
+            'jointly learn R/v/p IMU precision and a causal visual '
+            'correspondence gate from frozen ConvGRU evidence, IMU quality, '
+            'and visual--IMU innovation; requires --use_learned_imu_precision'
+        ),
+    )
+    parser.add_argument(
+        '--joint_visual_imu_reciprocal', action='store_true',
+        help='learn reciprocal visual/IMU gains on valid temporal edges; checkpointed equation version 1',
+    )
+    parser.add_argument(
+        '--joint_visual_imu_full_stage_only',
+        action='store_true',
+        help=(
+            'apply the joint visual--IMU gate only in full 15DoF unrolls; '
+            'keep the visual-only preconditioning prefix exactly DROID'
+        ),
+    )
+    parser.add_argument(
+        '--use_joint_visual_gate_pair_training',
+        action='store_true',
+        help=(
+            'train a joint visual/IMU factor allocator with paired clean and '
+            'corrupted images and post-BA GT pose losses; allocation is '
+            'two-way softmax-normalized and requires frozen loaded direct '
+            'IMU R/v/p precision'
+        ),
+    )
+    parser.add_argument(
+        '--w_joint_visual_gate_rank',
+        type=float,
+        default=1.0,
+        help='legacy absolute-gate rank weight; must be zero for joint allocation',
+    )
+    parser.add_argument(
+        '--w_joint_visual_gate_identity',
+        type=float,
+        default=0.05,
+        help='legacy absolute-gate identity weight; must be zero for joint allocation',
+    )
+    parser.add_argument(
+        '--w_joint_visual_corrupt_pose',
+        type=float,
+        default=1.0,
+        help='post-BA GT pose loss weight on the visual-corruption branch',
+    )
+    parser.add_argument(
+        '--joint_visual_corruption_probability',
+        type=float,
+        default=1.0,
+        help='per-clip probability of generating the paired visual corruption',
+    )
+    parser.add_argument(
+        '--joint_visual_corruption_noise_std',
+        type=float,
+        default=12.0,
+        help='pixel-space noise standard deviation in paired visual corruption',
+    )
+    parser.add_argument(
+        '--joint_visual_corruption_brightness_min',
+        type=float,
+        default=0.50,
+        help='minimum multiplicative brightness for paired visual corruption',
+    )
+    parser.add_argument(
+        '--joint_visual_corruption_occlusion_fraction',
+        type=float,
+        default=0.25,
+        help='per-image occluder side fraction for paired visual corruption',
+    )
+    parser.add_argument(
         '--freeze_existing_imu_precision',
         action='store_true',
         help=(
             'freeze the loaded direct-precision head and train only the new '
-            'visual-conditioned innovation residual adapter'
+            'visual-conditioned innovation residual adapter or joint gate'
+        ),
+    )
+    parser.add_argument(
+        '--freeze_imu_cross_modal_calibration',
+        action='store_true',
+        help=(
+            'keep the checkpointed learned global [R,v,p] cross-modal '
+            'information calibration fixed while fine-tuning the temporal '
+            'direct-precision head'
         ),
     )
 
@@ -3407,6 +3928,10 @@ if __name__ == '__main__':
 
     if args.iters <= 0:
         raise ValueError('--iters must be positive')
+    if args.imu_train_max_dt is not None and (
+        not np.isfinite(args.imu_train_max_dt) or args.imu_train_max_dt < 0.0
+    ):
+        raise ValueError('--imu_train_max_dt must be finite and nonnegative')
     if args.imu_train_pose_only_steps < 0:
         raise ValueError('--imu_train_pose_only_steps must be non-negative')
     if args.imu_train_pose_only_steps > 0 and not args.use_full_imu_ba:
@@ -3484,6 +4009,11 @@ if __name__ == '__main__':
                 '--use_learned_imu_precision is standalone; do not combine it '
                 'with legacy confidence, lambda, or residual-weight controls'
             )
+    elif args.use_learned_imu_cross_modal_calibration:
+        raise ValueError(
+            '--use_learned_imu_cross_modal_calibration requires '
+            '--use_learned_imu_precision'
+        )
     if (
         args.use_imu_precision_discrepancy
         and not args.use_learned_imu_precision
@@ -3512,15 +4042,88 @@ if __name__ == '__main__':
             '--use_imu_precision_innovation'
         )
     if (
+        args.use_imu_rotation_flow_adapter
+        and not args.use_learned_imu_precision
+    ):
+        raise ValueError(
+            '--use_imu_rotation_flow_adapter requires '
+            '--use_learned_imu_precision'
+        )
+    if args.use_imu_rotation_flow_adapter and not args.use_full_imu_ba:
+        raise ValueError(
+            '--use_imu_rotation_flow_adapter requires --use_full_imu_ba'
+        )
+    if (
+        args.imu_rotation_flow_adapter_full_stage_only
+        and not args.use_imu_rotation_flow_adapter
+    ):
+        raise ValueError(
+            '--imu_rotation_flow_adapter_full_stage_only requires '
+            '--use_imu_rotation_flow_adapter'
+        )
+    if (
+        args.use_joint_visual_imu_confidence
+        and not args.use_learned_imu_precision
+    ):
+        raise ValueError(
+            '--use_joint_visual_imu_confidence requires '
+            '--use_learned_imu_precision'
+        )
+    if (
+        args.joint_visual_imu_full_stage_only
+        and not args.use_joint_visual_imu_confidence
+    ):
+        raise ValueError(
+            '--joint_visual_imu_full_stage_only requires '
+            '--use_joint_visual_imu_confidence'
+        )
+    if args.joint_visual_imu_reciprocal and not (
+        args.use_joint_visual_imu_confidence and args.joint_visual_imu_full_stage_only
+        and args.use_joint_visual_gate_pair_training and args.freeze_existing_imu_precision
+    ):
+        raise ValueError('reciprocal allocation requires full-stage paired training and frozen direct precision')
+    if args.use_joint_visual_gate_pair_training:
+        if not args.use_joint_visual_imu_confidence:
+            raise ValueError(
+                '--use_joint_visual_gate_pair_training requires '
+                '--use_joint_visual_imu_confidence'
+            )
+        if not args.freeze_existing_imu_precision:
+            raise ValueError(
+                '--use_joint_visual_gate_pair_training requires '
+                '--freeze_existing_imu_precision so direct R/v/p IMU '
+                'precision cannot co-adapt with the new joint allocator'
+            )
+        if args.w_imu_confidence_post_ba_pose == 0.0:
+            raise ValueError(
+                '--use_joint_visual_gate_pair_training requires a non-zero '
+                '--w_imu_confidence_post_ba_pose for the clean BA branch'
+            )
+        if args.w_joint_visual_corrupt_pose == 0.0:
+            raise ValueError(
+                '--use_joint_visual_gate_pair_training requires a non-zero '
+                '--w_joint_visual_corrupt_pose'
+            )
+        if not (0.0 < args.joint_visual_corruption_probability <= 1.0):
+            raise ValueError('--joint_visual_corruption_probability must be in (0, 1]')
+        if args.w_joint_visual_gate_rank != 0.0 or args.w_joint_visual_gate_identity != 0.0:
+            raise ValueError(
+                'joint visual/IMU allocation has no absolute gate rank or '
+                'identity target; set both legacy weights to zero'
+            )
+    if (
         args.freeze_existing_imu_precision
         and not (
             args.use_imu_precision_visual_innovation
             or args.use_imu_precision_edge_fusion
+            or args.use_joint_visual_imu_confidence
+            or args.use_imu_rotation_flow_adapter
+            or args.use_learned_imu_cross_modal_calibration
         )
     ):
         raise ValueError(
             '--freeze_existing_imu_precision requires '
-            'a new IMU precision adapter'
+            'a new IMU precision adapter or learned cross-modal calibration'
         )
     if args.imu_confidence_only_weighting:
         if not args.use_full_imu_ba:

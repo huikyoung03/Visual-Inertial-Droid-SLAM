@@ -16,6 +16,15 @@ TRAIN_SEQUENCES="${TRAIN_SEQUENCES:-MH_03_medium MH_04_difficult}"
 # selected frames are never retired from DepthVideo. This capacity is only for
 # that offline exporter; actual strict DROID/VI evaluations retain buffer=512.
 MANIFEST_BUFFER="${MANIFEST_BUFFER:-4096}"
+# Keep the training manifests tied to the exact visual candidate stream used
+# by runtime.  Default 2 retains the original 10 Hz protocol; use 4 only for
+# a separate 5 Hz train/evaluation experiment and a separate output directory.
+TRACKING_STRIDE="${TRACKING_STRIDE:-2}"
+
+[[ "$TRACKING_STRIDE" =~ ^[1-9][0-9]*$ ]] || {
+  echo "TRACKING_STRIDE must be a positive integer, got: $TRACKING_STRIDE" >&2
+  exit 2
+}
 
 export LD_LIBRARY_PATH="/home/ubuntu/miniconda3/envs/droid_env/lib:${LD_LIBRARY_PATH:-}"
 cd "$ROOT"
@@ -60,6 +69,8 @@ for sequence in "${SEQUENCES[@]}"; do
     --imagedir "$prepared/data" \
     --calib "$prepared/calib.txt" \
     --weights "$WEIGHTS" \
+    --stride "$TRACKING_STRIDE" \
+    --euroc_protocol_tracking_stride "$TRACKING_STRIDE" \
     --euroc_original_protocol \
     --buffer "$MANIFEST_BUFFER" \
     --disable_vis \
@@ -69,4 +80,4 @@ for sequence in "${SEQUENCES[@]}"; do
     --motion_filter_manifest_out "$manifest"
 done
 
-echo "[DONE] strict original-protocol manifests: $MANIFEST_ROOT"
+echo "[DONE] strict original-protocol manifests: $MANIFEST_ROOT (tracking_stride=$TRACKING_STRIDE)"

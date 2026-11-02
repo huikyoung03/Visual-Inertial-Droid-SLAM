@@ -168,14 +168,24 @@ figures/*.pdf
 /runs/
 /cache/
 
-# Keep only the two final presentation diagrams.  Raw/metric PLY files and
-# trajectory screenshots are generated artifacts, not source assets.
-/presentation_assets/*
-!/presentation_assets/final_direct_rvp_architecture.svg
-!/presentation_assets/final_direct_rvp_training.svg
+# Presentation figures from earlier model variants are not part of the
+# selected alpha-750 source release.
+/presentation_assets/
+
+# Curate only the selected model's public metadata and result records.
+/configs/*
+!/configs/final_alpha750.env.example
+/models/*
+!/models/FINAL_CHECKPOINT.md
+/results/*
+!/results/FINAL_MODEL_SELECTION_2026_11_02.md
+!/results/REFERENCE_MODELS_2026_11_02.md
+/docs/*
+!/docs/FINAL_ALPHA750_ARCHITECTURE.md
 
 # Internal notes and chronological experiment reports are not part of the
-# public release.  FINAL_PPT_TECHNICAL_BRIEF.md is the one curated document.
+# public release.  docs/FINAL_ALPHA750_ARCHITECTURE.md is the curated model note.
+/FINAL_PPT_TECHNICAL_BRIEF.md
 /CHAPTER3_PRESENTATION_STORY.md
 /CODE_FLOW_REPORT.md
 /CURRENT_EXPERIMENT_STATUS_REPORT_*.md
@@ -187,14 +197,15 @@ figures/*.pdf
 /run_webp_imu_selected_experiment.sh
 /export_reconstruction_ply.py
 
-# Only final public tools are added from the otherwise experimental tools/
-# workspace.  Already tracked upstream DROID tools remain untouched.
+# Only the selected model's public tools are added from the experimental
+# tools/ workspace. Already tracked upstream DROID tools remain untouched.
 /tools/*
 !/tools/evaluate_euroc_recon.py
 !/tools/export_euroc_original_protocol_motion_filter_manifests.sh
 !/tools/imu_preintegrate.py
 !/tools/prepare_euroc_original_protocol_assets.py
-!/tools/run_final_direct_rvp_train.sh
-!/tools/run_final_v1_03_evaluation.sh
+!/tools/run_base_confidence_train.sh
+!/tools/run_final_alpha750_train.sh
+!/tools/run_final_alpha750_evaluation.sh
 
 

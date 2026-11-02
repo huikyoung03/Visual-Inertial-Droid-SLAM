@@ -140,6 +140,23 @@ class MotionFilter:
         # frame filtering 효과를 제거하고 전체 frame을 넣어보고 싶을 때 사용
         self.force_all_frames = getattr(args, "force_all_frames", False)
 
+        # Optional VIO continuity control. The visual motion criterion remains
+        # the primary keyframe rule; this adds a frame only when the composed
+        # IMU interval from the last selected keyframe would reach the stated
+        # duration. A value of zero keeps original DROID selection exactly.
+        self.imu_max_keyframe_gap_sec = max(
+            0.0, float(getattr(args, "motion_filter_max_imu_gap_sec", 0.0))
+        )
+        self.imu_gap_forced_count = 0
+        self.video.motion_filter_max_imu_gap_sec = self.imu_max_keyframe_gap_sec
+        self.video.motion_filter_imu_gap_forced_count = 0
+        if self.imu_max_keyframe_gap_sec > 0.0:
+            print(
+                "[IMU-MAX-GAP] MotionFilter visual rule is retained; "
+                f"an IMU-connected keyframe is additionally required at "
+                f"dt>={self.imu_max_keyframe_gap_sec:.6g}s"
+            )
+
         # IMU rotation norm이 이 값 이상이면 frame을 강제로 유지
         #
         # 단위:
@@ -424,6 +441,28 @@ class MotionFilter:
         adjusted = self.thresh - self.imu_filter_gain * imu_rot_norm
 
         return max(adjusted, self.imu_min_filter_thresh)
+
+    def _imu_gap_forces_frame(self, selected_imu_prior):
+        """Return whether accepting this frame prevents an overlong IMU edge.
+
+        ``selected_imu_prior`` is composed from the last selected keyframe to
+        the current input frame, unlike the raw camera-rate prior. Requiring a
+        frame at the configured boundary preserves DROID's visual criterion on
+        all shorter intervals while ensuring the full IMU factor can remain
+        below its own ``imu_full_max_dt`` limit.
+        """
+
+        if self.imu_max_keyframe_gap_sec <= 0.0:
+            return False
+        if not self._imu_is_usable(selected_imu_prior):
+            return False
+        try:
+            interval_sec = float(selected_imu_prior.get("dt", 0.0))
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return math.isfinite(interval_sec) and interval_sec >= (
+            self.imu_max_keyframe_gap_sec - 1e-9
+        )
 
     def axis_angle_to_quat(self, rx, ry, rz):
         """
@@ -886,6 +925,7 @@ class MotionFilter:
             self.use_imu_filter
             and imu_rot_norm >= float(self.imu_rot_thresh)
         )
+        imu_gap_forces_frame = self._imu_gap_forces_frame(selected_imu_prior)
 
         alignment_ready = bool(
             getattr(self.video, "imu_alignment_ready", None).value
@@ -905,6 +945,7 @@ class MotionFilter:
         should_append = (
             visual_motion > adjusted_thresh
             or imu_forces_frame
+            or imu_gap_forces_frame
             or self.force_all_frames
             or bootstrap_active
         )
@@ -928,6 +969,18 @@ class MotionFilter:
                 inp[0],
                 selected_imu_prior,
             )
+            if imu_gap_forces_frame:
+                self.imu_gap_forced_count += 1
+                self.video.motion_filter_imu_gap_forced_count = (
+                    self.imu_gap_forced_count
+                )
+                if self.imu_gap_forced_count <= 5 or self.imu_gap_forced_count % 25 == 0:
+                    print(
+                        "[IMU-MAX-GAP] forced frame "
+                        f"t={tstamp}, composed_dt="
+                        f"{float(selected_imu_prior.get('dt', 0.0)):.6g}s, "
+                        f"count={self.imu_gap_forced_count}"
+                    )
             if bootstrap_active:
                 self._vi_init_bootstrap_selected += 1
 

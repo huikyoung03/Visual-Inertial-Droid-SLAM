@@ -118,6 +118,18 @@ class DroidBackend:
                 not visual_only
                 and getattr(self.args, "use_learned_imu_precision", False)
             ),
+            use_learned_imu_cross_modal_calibration=(
+                not visual_only
+                and getattr(self.args, "use_learned_imu_cross_modal_calibration", False)
+            ),
+            imu_cross_modal_calibration=(
+                self.net.get_imu_cross_modal_calibration()
+                if (
+                    not visual_only
+                    and getattr(self.args, "use_learned_imu_cross_modal_calibration", False)
+                )
+                else None
+            ),
             use_imu_precision_discrepancy=(
                 not visual_only
                 and getattr(self.args, "use_imu_precision_discrepancy", False)
@@ -135,6 +147,20 @@ class DroidBackend:
             use_imu_precision_edge_fusion=(
                 not visual_only
                 and getattr(self.args, "use_imu_precision_edge_fusion", False)
+            ),
+            use_joint_visual_imu_confidence=(
+                not visual_only
+                and getattr(self.args, "use_joint_visual_imu_confidence", False)
+            ),
+            joint_visual_imu_full_stage_only=getattr(
+                self.args, "joint_visual_imu_full_stage_only", False
+            ),
+            use_imu_rotation_flow_adapter=(
+                not visual_only
+                and getattr(self.args, "use_imu_rotation_flow_adapter", False)
+            ),
+            imu_rotation_flow_adapter_full_stage_only=getattr(
+                self.args, "imu_rotation_flow_adapter_full_stage_only", False
             ),
             use_component_imu_confidence=(
                 not visual_only
@@ -223,10 +249,18 @@ class DroidBackend:
             imu_ba_outer_relinearize=getattr(self.args, "imu_ba_outer_relinearize", False),
             imu_ba_outer_relinearize_interval=getattr(self.args, "imu_ba_outer_relinearize_interval", 10),
             imu_ba_outer_window=getattr(self.args, "imu_ba_outer_window", 0),
+            imu_full_ba_outer_relinearize=getattr(
+                self.args, "imu_full_ba_outer_relinearize", False
+            ),
             imu_ba_debug=getattr(self.args, "imu_ba_debug", False),
             imu_ba_debug_path=getattr(self.args, "imu_ba_debug_path", None),
             imu_ba_debug_max_rows=getattr(self.args, "imu_ba_debug_max_rows", 20000),
             imu_ba_debug_stage="backend",
+            imu_state_update_audit_path=getattr(
+                self.args, "imu_state_update_audit_path", None
+            ),
+            imu_influence_audit_path=getattr(self.args, "imu_influence_audit_path", None),
+            imu_influence_audit_min_window=getattr(self.args, "imu_influence_audit_min_window", 128),
         )
 
         graph.add_proximity_factors(rad=self.backend_radius,
@@ -276,6 +310,14 @@ class DroidAsyncBackend:
             apply_imu_residual=getattr(args, "use_imu_residual", False),
             use_learned_imu_confidence=getattr(args, "use_learned_imu_confidence", False),
             use_learned_imu_precision=getattr(args, "use_learned_imu_precision", False),
+            use_learned_imu_cross_modal_calibration=getattr(
+                args, "use_learned_imu_cross_modal_calibration", False
+            ),
+            imu_cross_modal_calibration=(
+                net.get_imu_cross_modal_calibration()
+                if getattr(args, "use_learned_imu_cross_modal_calibration", False)
+                else None
+            ),
             use_imu_precision_discrepancy=getattr(
                 args, "use_imu_precision_discrepancy", False
             ),
@@ -287,6 +329,12 @@ class DroidAsyncBackend:
             ),
             use_imu_precision_edge_fusion=getattr(
                 args, "use_imu_precision_edge_fusion", False
+            ),
+            use_joint_visual_imu_confidence=getattr(
+                args, "use_joint_visual_imu_confidence", False
+            ),
+            joint_visual_imu_full_stage_only=getattr(
+                args, "joint_visual_imu_full_stage_only", False
             ),
             use_component_imu_confidence=getattr(args, "use_component_imu_confidence", False),
             use_dvi_imu_confidence=getattr(args, "use_dvi_imu_confidence", False),
@@ -357,10 +405,18 @@ class DroidAsyncBackend:
             imu_ba_outer_relinearize=getattr(args, "imu_ba_outer_relinearize", False),
             imu_ba_outer_relinearize_interval=getattr(args, "imu_ba_outer_relinearize_interval", 10),
             imu_ba_outer_window=getattr(args, "imu_ba_outer_window", 0),
+            imu_full_ba_outer_relinearize=getattr(
+                args, "imu_full_ba_outer_relinearize", False
+            ),
             imu_ba_debug=getattr(args, "imu_ba_debug", False),
             imu_ba_debug_path=getattr(args, "imu_ba_debug_path", None),
             imu_ba_debug_max_rows=getattr(args, "imu_ba_debug_max_rows", 20000),
             imu_ba_debug_stage="async_backend",
+            imu_state_update_audit_path=getattr(
+                args, "imu_state_update_audit_path", None
+            ),
+            imu_influence_audit_path=getattr(args, "imu_influence_audit_path", None),
+            imu_influence_audit_min_window=getattr(args, "imu_influence_audit_min_window", 128),
         )
 
     @torch.no_grad()

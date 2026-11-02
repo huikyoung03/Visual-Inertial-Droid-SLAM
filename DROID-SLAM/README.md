@@ -1,78 +1,81 @@
-# DROID-SLAM with Direct Learned R/V/P IMU Attenuation
+# DROID-SLAM with learned IMU confidence and cross-modal calibration
 
-This repository is a focused visual–inertial extension of
-[DROID-SLAM](https://arxiv.org/abs/2108.10869). It preserves the pretrained
-DROID visual tracker and adds a compact learned head that decides how much to
-trust the **rotation, velocity, and position** components of each IMU
-preintegration factor.
+This repository extends [DROID-SLAM](https://arxiv.org/abs/2108.10869) with a
+15DoF visual–inertial factor graph. The selected research checkpoint is
+`learned_cross_modal_alpha_localmatched_mh03_mh04_1k_000750.pth`.
 
-The public release is centered on one final configuration:
+The pretrained DROID visual network remains frozen. A small head reads its
+ConvGRU state and seven IMU-preintegration features to predict separate
+rotation, velocity, and position confidence values for each temporal factor.
+Three learned global calibration values, `alpha=[alpha_R, alpha_v, alpha_p]`,
+set the relative information scale of those IMU components. The visual and
+IMU factors then update the same pose variables in 15DoF bundle adjustment.
+
+## Selected result and scope
+
+All values below are **dense whole-trajectory Sim(3) ATE RMSE** in metres,
+using the original EuRoC cam0 protocol, tracking stride 2, trajectory-fill
+stride 1, and the same GT timestamps. Lower is better.
+
+| Sequence | Original visual DROID | Selected learned model | Change |
+| --- | ---: | ---: | ---: |
+| V1_03 | 0.018560 | **0.018312** | 1.34% lower |
+| V2_03 | **0.013864** | 0.014157 | 2.11% higher |
+| MH05 | 0.042880 | **0.042225** | 1.53% lower |
+
+V1_03 was used repeatedly to choose model variants, so it is not a wholly
+untouched model-selection test. These are single-run observations, not a claim
+of statistically significant or universal improvement. Sim(3) alignment
+removes global scale error; metric-scale accuracy must be reported separately.
+See [the selection record](results/FINAL_MODEL_SELECTION_2026_11_02.md).
+
+## Active model path
 
 ```text
-frozen DROID visual backbone
-  + raw IMU preintegration and calibrated covariance
-  + direct learned (c_R, c_v, c_p) in (0, 1]^3
-  + two-stage 15DoF visual–inertial BA
+rectified cam0 frames + calibration -> DROID MotionFilter -> visual factor graph
+                                           |
+                                           v
+                                 FNet/CNet -> ConvGRU
+                                           |          + IMU quality 7D
+                                           |                    |
+                                           +-> confidence head <-+
+                                               c_R, c_v, c_p
+
+gyro + accel + timestamps + calibration -> IMU preintegration
+                                           -> R/v/p and bias residuals
+
+visual reprojection factors + covariance information * confidence * learned alpha
+                                           -> local and global 15DoF BA
+                                           -> dense pose trajectory
 ```
 
-`c=1` means the full covariance-normalized physical IMU factor. The network
-may attenuate an unreliable temporal factor, but cannot amplify it above the
-sensor-calibrated reference. There is no global learned IMU lambda in the
-final model.
+The active IMU information multiplier is `alpha_k * c_k` for
+`k in {R, v, p}`. The confidence head outputs values in `(0, 1)` per interval;
+the learned alpha values are global checkpoint parameters. There is no
+manually chosen global scalar IMU lambda. Bias random-walk rows use the sensor
+noise model and are not gated by `c_R/c_v/c_p`. The selected checkpoint has
+`alpha=[1.2150, 1.2126, 1.9887]`. Visual factor weights are produced by the
+frozen DROID head; the optional joint visual/IMU gate is not active.
 
-## Final result
+The fixed runtime schedule is:
 
-On held-out EuRoC `V1_03_difficult`, using the strict original DROID EuRoC
-protocol and dense whole-trajectory Sim(3) ATE:
+```text
+selected keyframe -> visual local DBA x3 -> VI initialization when observable
+                  -> visual+IMU full 15DoF local DBA x2
+end of sequence   -> visual global BA x7 -> visual+IMU full 15DoF global BA x12
+                  -> fill poses on all original camera timestamps
+```
 
-| model | Sim(3) ATE RMSE | dense poses |
-|---|---:|---:|
-| Original visual DROID | 0.018560 m | 2,149 |
-| Direct learned R/V/P IMU attenuation | **0.018467 m** | 2,149 |
-
-This is a 0.093 mm / 0.501% numerical reduction on one held-out sequence and
-one run. It is not presented as a statistical generalization claim. See
-[results/V1_03_FINAL_RESULT.md](results/V1_03_FINAL_RESULT.md) for the exact
-protocol and [FINAL_PPT_TECHNICAL_BRIEF.md](FINAL_PPT_TECHNICAL_BRIEF.md) for
-the code-level architecture, training, and presentation material.
-
-## Architecture
-
-![Final direct R/V/P model](presentation_assets/final_direct_rvp_architecture.svg)
-
-For a temporal keyframe edge, the direct head reads:
-
-- the frozen DROID ConvGRU visual state, projected as `128 -> 32`;
-- a 7D IMU-quality descriptor from preintegrated `dt`, `dR`, `dv`, `dp`, and
-  relative R/V/P information.
-
-It fuses `32 + 16` features and predicts three logits:
-
-\[
-c=\exp[-\operatorname{softplus}(z)] \in (0,1]^3.
-\]
-
-In 15DoF BA the state per keyframe is pose(6), velocity(3), accelerometer
-bias(3), and gyroscope bias(3). The covariance-normalized residual and its
-Jacobian are scaled component-wise:
-
-\[
-\tilde r_R=\sqrt{c_R}r_R,\qquad
-\tilde r_v=\sqrt{c_v}r_v,\qquad
-\tilde r_p=\sqrt{c_p}r_p.
-\]
-
-Bias random-walk residuals remain governed by the physical sensor model; they
-are not suppressed by these three values.
+Initial warmup has its own visual iterations. Full local 15DoF updates begin
+only after VI initialization succeeds. An IMU interval longer than 0.5 s
+does not contribute an IMU factor; the image and visual factors remain.
+See [the code-level architecture](docs/FINAL_ALPHA750_ARCHITECTURE.md).
 
 ## Installation
-
-Clone recursively because the project uses `lietorch` and `pytorch_scatter`.
 
 ```bash
 git clone --recursive <YOUR_REPOSITORY_URL>
 cd DROID-SLAM
-
 conda env create -f environment_novis.yaml
 conda activate droid_env
 pip install -r requirements.txt
@@ -81,119 +84,71 @@ pip install thirdparty/pytorch_scatter
 pip install -e .
 ```
 
-Use a PyTorch/CUDA build compatible with the local NVIDIA driver. The
-evaluation uses a CUDA GPU and needs roughly 11 GB or more of VRAM.
+Use a CUDA/PyTorch build compatible with the host GPU and driver. Keep the
+upstream `droid.pth` and the selected learned checkpoint outside ordinary Git
+source history. Their origin and checksum are listed in
+[models/FINAL_CHECKPOINT.md](models/FINAL_CHECKPOINT.md).
 
-## Weights
+## Reproduce the V1_03 evaluation
 
-Two weights are required:
-
-1. Upstream visual DROID checkpoint, `droid.pth`.
-2. Final learned checkpoint,
-   `learned_attenuation_rvp_quality_pretrain_joint2000_001000.pth`.
-
-The final checkpoint is distributed as a release asset rather than committed
-to source history. Its SHA-256 is recorded in
-[models/FINAL_CHECKPOINT.md](models/FINAL_CHECKPOINT.md). Put both files at
-any local paths and configure them through environment variables.
-
-## Data preparation
-
-The final protocol expects a prepared EuRoC camera directory containing
-`data/`, `frames.csv`, and `imu0_sensor.yaml`, plus a rectified IMU prior and
-rectified camera YAML generated from the same camera–IMU calibration.
-
-The preparation utilities retained for this release are:
-
-```text
-tools/prepare_euroc_original_protocol_assets.py
-tools/export_euroc_original_protocol_motion_filter_manifests.sh
-tools/imu_preintegrate.py
-```
-
-Dataset paths are intentionally not hard-coded. Copy
-`configs/final_direct_rvp.env.example` outside the repository, edit its
-absolute paths, then source it:
+The prepared camera directory must contain `data/`, `frames.csv`, and
+`imu0_sensor.yaml`. The rectified IMU prior must be generated with the same
+camera–IMU calibration and placed beside `calib_rectified.txt` and
+`cam0_sensor_rectified.yaml`. The preparation tools are in `tools/`.
 
 ```bash
-cp configs/final_direct_rvp.env.example /tmp/final_direct_rvp.env
-# Edit /tmp/final_direct_rvp.env
-source /tmp/final_direct_rvp.env
+cp configs/final_alpha750.env.example /tmp/final_alpha750.env
+# Edit every absolute path in /tmp/final_alpha750.env.
+source /tmp/final_alpha750.env
+EVAL_PREFLIGHT_ONLY=1 bash tools/run_final_alpha750_evaluation.sh
+bash tools/run_final_alpha750_evaluation.sh
 ```
 
-## Reproduce the final V1_03 evaluation
+The script checks the exact selected checkpoint SHA-256, runs original visual
+DROID and the selected model on the same input, and writes dense full and
+common-frame Sim(3) reports into `OUT_DIR`. It has no switches for fixed
+confidence, manual lambda, joint visual gates, rotation-flow adapters, or
+other experimental paths.
 
-```bash
-source /path/to/final_direct_rvp.env
-bash tools/run_final_v1_03_evaluation.sh
-```
+## Reproduce the training stages
 
-The script performs exactly three actions:
+Training uses EuRoC `MH_03_medium` and `MH_04_difficult`, their frozen
+original-protocol MotionFilter manifests, and camera stride 2. `V1_03` is not
+used for gradient-based training.
 
-1. runs original visual DROID;
-2. runs the final learned direct R/V/P 15DoF model;
-3. evaluates both dense trajectories with whole-trajectory Sim(3) ATE.
+1. `bash tools/run_base_confidence_train.sh` trains the direct R/v/p head:
+   500-step quality pretraining followed by 2,000-step post-BA fine-tuning.
+   The selected base is its **1,000-step phase-B snapshot**.
+2. Set `BASE_CONFIDENCE_WEIGHTS` to that base checkpoint, then run
+   `bash tools/run_final_alpha750_train.sh`. It freezes the visual network,
+   confidence head, and global IMU biases, trains only three alpha parameters
+   for 1,000 steps, and saves the **750-step selected snapshot**.
 
-It fixes the runtime schedule to:
+The released checkpoints remain the reference artifacts; a fresh run may
+differ because training is stochastic. The selected alpha training used a
+seven-frame local `visual:3, full:2` unroll. The global backend is evaluated
+on full sequences and is not unrolled during this training stage.
 
-```text
-local visual DBA x3 -> local full 15DoF DBA x2
-global visual DBA x7 -> global full 15DoF BA x12
-```
+## Main source files
 
-It does **not** expose fixed-confidence, global-lambda, discrepancy,
-innovation, edge-fusion, or other ablation switches.
+| File | Role |
+| --- | --- |
+| `demo.py` | Image/IMU-prior input, rectification, inference, dense trajectory output |
+| `droid_slam/motion_filter.py` | Visual frame selection and composed IMU intervals |
+| `droid_slam/droid_net.py` | Frozen DROID visual network, direct R/v/p head, learned alpha |
+| `droid_slam/geom/imu_factor.py` | IMU quality features and preintegration helpers |
+| `droid_slam/factor_graph.py` | Temporal graph edges and confidence transfer to IMU factors |
+| `droid_slam/geom/ba.py` | Joint 15DoF residual/Jacobian weighting |
+| `droid_slam/droid_frontend.py` | Local visual then full 15DoF updates |
+| `droid_slam/droid_backend.py` | Global graph refinement |
+| `train.py` | Confidence and alpha optimization |
 
-## Train the final architecture
-
-```bash
-source /path/to/final_direct_rvp.env
-bash tools/run_final_direct_rvp_train.sh
-```
-
-The script uses `MH_03_medium` and `MH_04_difficult`, freezes the original
-visual DROID network and global IMU-bias parameters, then trains only the
-6,291-parameter direct precision head. It has two stages:
-
-1. 500-step IMU-quality / augmentation calibration pretraining.
-2. 2,000-step joint fine-tuning with post-BA pose loss and calibration loss.
-
-The final reported candidate is the phase-B 1k checkpoint; V1_03 must remain
-held out from gradient-based training.
-
-## Repository layout
-
-```text
-droid_slam/                         Core DROID + VI factor graph / 15DoF BA
-droid_slam/geom/imu_factor.py       IMU factor, quality descriptor, covariance logic
-droid_slam/geom/ba.py               R/V/P attenuation applied to residual/Jacobian
-train.py                            Frozen-backbone direct-head training
-demo.py                             Streaming DROID + two-stage VIO inference
-tools/run_final_direct_rvp_train.sh Final training entry point
-tools/run_final_v1_03_evaluation.sh Final evaluation entry point
-tools/evaluate_euroc_recon.py       Dense Sim(3) evaluation
-configs/                            Machine-local path template
-models/                             Checkpoint distribution metadata
-results/                            Small, versioned final result table
-presentation_assets/                Final editable SVG diagrams
-```
-
-Intermediate logs, reconstructed trajectories, datasets, PLY files, and
-experiment queues are ignored by Git. See
-[GITHUB_UPLOAD_GUIDE.md](GITHUB_UPLOAD_GUIDE.md) for the explicit upload list.
+The final scripts expose only the selected execution path. Older experiments
+remain in the research workspace but are excluded from the curated GitHub
+upload. See [the upload guide](GITHUB_UPLOAD_GUIDE.md) for the file list.
 
 ## Attribution
 
-This codebase builds on:
-
-```bibtex
-@article{teed2021droid,
-  title={DROID-SLAM: Deep Visual SLAM for Monocular, Stereo, and RGB-D Cameras},
-  author={Teed, Zachary and Deng, Jia},
-  journal={Advances in Neural Information Processing Systems},
-  year={2021}
-}
-```
-
-Retain the upstream license and third-party license notices when redistributing
-this repository.
+This work builds on the original DROID-SLAM implementation by Zachary Teed
+and Jia Deng. Retain the upstream and third-party license notices when
+redistributing the repository.
