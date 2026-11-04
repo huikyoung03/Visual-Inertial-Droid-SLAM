@@ -36,10 +36,9 @@ camera/IMU timestamps, creates IMU priors, invokes the sibling `DROID-SLAM/`
 model, exports a filtered metric PLY, and hosts a touch viewer.
 
 ```bash
-cd SLAM
-python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r requirements.txt
+cd DROID-SLAM
+bash scripts/install_phone_server.sh
+cd ../SLAM
 bash start_alpha750_server.sh
 ```
 
