@@ -55,3 +55,19 @@ Large model files are GitHub Release assets, not ordinary Git files:
 
 The selected learned checkpoint SHA-256 is
 `63bdbb5965c683962ad382a9e7477a04b130ce58ec2e0752637babf8669eacfa`.
+
+##실행 코드 
+
+```
+git clone --recursive https://github.com/huikyoung03/SLAM.git
+cd SLAM/DROID-SLAM
+
+bash scripts/install_droid_env.sh
+conda activate droid_env
+bash scripts/download_model_assets.sh
+python scripts/verify_droid_env.py
+
+bash scripts/install_phone_server.sh
+cd ../SLAM
+bash start_alpha750_server.sh
+```
