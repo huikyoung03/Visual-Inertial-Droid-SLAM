@@ -1,0 +1,16 @@
+# Runtime/evaluation dependencies tested with Python 3.8.20 and torch 2.4.1+cu118.
+# Install PyTorch separately through scripts/install_droid_env.sh so its CUDA wheel
+# always matches CUDA 11.8. Do not add a CPU-only torch wheel here.
+numpy==1.24.3
+scipy==1.10.1
+opencv-contrib-python==5.0.0.93
+open3d==0.19.0
+tqdm==4.67.3
+PyYAML==6.0.2
+evo==1.31.1
+matplotlib==3.7.5
+pandas==2.0.3
+h5py==3.11.0
+gdown==5.2.2
+tensorboard==2.14.0
+Pillow==10.4.0

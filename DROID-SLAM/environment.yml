@@ -1,0 +1,12 @@
+name: droid_env
+channels:
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.8.20
+  - pip
+  # The CUDA compiler builds lietorch, torch-scatter, and droid_backends.
+  # PyTorch itself is installed from the cu118 wheel index by the installer.
+  - cuda-nvcc=11.8
+  - cmake>=3.22
+  - ninja

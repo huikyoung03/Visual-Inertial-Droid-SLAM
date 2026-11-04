@@ -1,0 +1,14 @@
+# Runtime artefacts and model binaries are intentionally not committed.
+**/__pycache__/
+**/*.py[cod]
+**/.venv/
+**/.venv-phone/
+**/uploads/
+**/logs/
+**/outputs/
+**/checkpoints/
+**/datasets/
+**/*.pth
+**/*.ply
+**/build/
+**/*.egg-info/

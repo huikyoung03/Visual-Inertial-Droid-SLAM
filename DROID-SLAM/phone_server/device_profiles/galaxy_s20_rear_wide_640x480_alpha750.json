@@ -1,0 +1,130 @@
+{
+  "id": "galaxy_s20_rear_wide_640x480_alpha750",
+  "name": "Galaxy S20 rear wide — alpha750 15DoF demo",
+  "status": "provisional",
+  "description": "Controlled phone demo using the learned cross-modal alpha750 checkpoint; camera/IMU calibration is copied from the measured provisional S20 profile.",
+  "capture": {
+    "camera": "rear_wide",
+    "width": 640,
+    "height": 480,
+    "target_fps": 10,
+    "orientation": "landscape",
+    "image_format": "jpeg",
+    "jpeg_quality": 0.8
+  },
+  "camera": {
+    "calibration_resolution": [
+      640,
+      480
+    ],
+    "intrinsics": [
+      641.2279448730656,
+      642.9441345739627,
+      312.5429919330121,
+      246.96227953411832
+    ],
+    "distortion": [
+      0.10417723503865853,
+      -0.5217167383713663,
+      0.0007208155320557287,
+      0.00023034802319835517,
+      0.9751682399631455
+    ],
+    "calibration_method": "OpenCV checkerboard calibration, 640x480, 10x7 inner corners, RMS 0.4644 px"
+  },
+  "imu": {
+    "gyro_unit": "rad/s",
+    "accel_unit": "m/s^2",
+    "R_imu_to_camera": [
+      [
+        0.9999405832062332,
+        -0.001349331573280746,
+        0.010817086552398754
+      ],
+      [
+        -0.0013241805642960937,
+        -0.9999964042859796,
+        -0.00233194359825126
+      ],
+      [
+        0.010820194222373307,
+        0.0023174812658641433,
+        -0.999938774464503
+      ]
+    ],
+    "t_imu_to_camera_m": [
+      0.005923037935972501,
+      0.0006230475547567679,
+      0.04287304564180021
+    ],
+    "camera_imu_time_offset_sec": -0.023,
+    "camera_imu_time_offset_convention": "imu_aligned_time = imu_raw_time + offset",
+    "gyro_bias_rad_s": [
+      3.91967499e-05,
+      7.24305724e-06,
+      0.000134998631
+    ],
+    "accel_bias_m_s2": [
+      -0.14440882,
+      0.05729741,
+      -0.01326069
+    ],
+    "accel_scale": [
+      0.99599456,
+      0.99587111,
+      0.99987877
+    ],
+    "gyro_noise_density": 0.00010616426512372181,
+    "gyro_random_walk": 2e-05,
+    "accel_noise_density": 0.0008584707906706499,
+    "accel_random_walk": 0.00019392838987062065,
+    "calibration_method": "PROVISIONAL only: R_CI and -23 ms offset from four-session joint rotation/time validation; t_CI is the robust component median of target sessions 1, 3, and 4 after excluding session 2; stationary Allan noise uses conservative per-axis maxima. gyro_random_walk=2e-5 is a conservative plateau-derived bound, not a directly observed random-walk slope."
+  },
+  "provenance": {
+    "allow_only_with_environment": "ALLOW_PROVISIONAL_IMU=1",
+    "rotation_time": "four-session joint rotation/time calibration; raw capture artifacts are not bundled",
+    "translation_sessions_used": [
+      "session_android_1793201511728",
+      "session_android_1793202916865",
+      "session_android_1793203615538"
+    ],
+    "translation_sessions_excluded": [
+      "session_android_1793201954609"
+    ],
+    "stationary_allan": "stationary Allan analysis; raw capture artifacts are not bundled",
+    "limitations": [
+      "Target-session translation spread remains centimetre-scale.",
+      "Gyro random walk was not directly observed in the stationary Allan slope region.",
+      "Use only for controlled 15DoF runtime comparison; do not report it as a final metrology calibration."
+    ],
+    "runtime_model": "alpha750: direct R/v/p confidence plus learned global cross-modal calibration",
+    "calibration_copied_from": "internal Galaxy S20 provisional calibration profile",
+    "imu_gap_policy": "No hard keyframe-duration cutoff in VI initialization or full 15DoF IMU BA; invalid/missing measurements can still be rejected."
+  },
+  "runtime": {
+    "visual_only": {
+      "weights": "droid.pth",
+      "stride": 1,
+      "buffer": 512,
+      "filter_thresh": 2.4,
+      "warmup": 15,
+      "keyframe_thresh": 3.0
+    },
+    "imu_15dof": {
+      "weights": "checkpoints/learned_cross_modal_alpha_localmatched_mh03_mh04_1k_000750.pth",
+      "stride": 1,
+      "buffer": 512,
+      "filter_thresh": 2.4,
+      "warmup": 15,
+      "keyframe_thresh": 3.0,
+      "use_learned_imu_cross_modal_calibration": true,
+      "imu_full_max_dt_sec": 0.0,
+      "vi_init_max_dt_sec": 0.0
+    }
+  },
+  "ply": {
+    "filter_threshold": 0.2,
+    "filter_count": 3,
+    "align_gravity_up": true
+  }
+}
